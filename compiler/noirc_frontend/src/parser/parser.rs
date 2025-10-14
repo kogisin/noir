@@ -6,7 +6,8 @@ use noirc_errors::{Location, Span};
 use crate::{
     ast::{Ident, ItemVisibility},
     lexer::{Lexer, lexer::LocatedTokenResult},
-    token::{FmtStrFragment, IntType, Keyword, LocatedToken, Token, TokenKind, Tokens},
+    node_interner::ExprId,
+    token::{FmtStrFragment, IntegerTypeSuffix, Keyword, LocatedToken, Token, TokenKind, Tokens},
 };
 
 use super::{ParsedModule, ParserError, ParserErrorReason, labels::ParsingRuleLabel};
@@ -219,7 +220,12 @@ impl<'a> Parser<'a> {
                     }
                 },
                 Some(Err(lexer_error)) => self.errors.push(lexer_error.into()),
-                None => return (eof_located_token(), last_comments),
+                None => {
+                    let end_span = Span::single_char(self.current_token_location.span.end());
+                    let end_location = Location::new(end_span, self.current_token_location.file);
+                    let end_token = LocatedToken::new(Token::EOF, end_location);
+                    return (end_token, last_comments);
+                }
             }
         }
     }
@@ -263,24 +269,11 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn eat_int_type(&mut self) -> Option<IntType> {
-        let is_int_type = matches!(self.token.token(), Token::IntType(..));
-        if is_int_type {
-            let token = self.bump();
-            match token.into_token() {
-                Token::IntType(int_type) => Some(int_type),
-                _ => unreachable!(),
-            }
-        } else {
-            None
-        }
-    }
-
-    fn eat_int(&mut self) -> Option<FieldElement> {
+    fn eat_int(&mut self) -> Option<(FieldElement, Option<IntegerTypeSuffix>)> {
         if matches!(self.token.token(), Token::Int(..)) {
             let token = self.bump();
             match token.into_token() {
-                Token::Int(int) => Some(int),
+                Token::Int(int, suffix) => Some((int, suffix)),
                 _ => unreachable!(),
             }
         } else {
@@ -348,9 +341,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn eat_unquote_marker(&mut self) -> Option<ExprId> {
+        if let Some(token) = self.eat_kind(TokenKind::UnquoteMarker) {
+            match token.into_token() {
+                Token::UnquoteMarker(expr_id) => return Some(expr_id),
+                _ => {
+                    unreachable!("Expected only `UnquoteMarker` to have `TokenKind::UnquoteMarker`")
+                }
+            }
+        }
+
+        None
+    }
+
     fn eat_attribute_start(&mut self) -> Option<bool> {
-        if matches!(self.token.token(), Token::AttributeStart { is_inner: false, .. }) {
+        if let Token::AttributeStart { is_inner: false, is_tag } = self.token.token() {
+            // We have parsed the attribute start token `#[`.
+            // Disable the "skip whitespaces" flag only for tag attributes so that the next `self.bump()`
+            // does not consume the whitespace following the upcoming token.
+            if *is_tag {
+                self.set_lexer_skip_whitespaces_flag(false);
+            }
             let token = self.bump();
+            self.set_lexer_skip_whitespaces_flag(true);
             match token.into_token() {
                 Token::AttributeStart { is_tag, .. } => Some(is_tag),
                 _ => unreachable!(),
@@ -361,8 +374,15 @@ impl<'a> Parser<'a> {
     }
 
     fn eat_inner_attribute_start(&mut self) -> Option<bool> {
-        if matches!(self.token.token(), Token::AttributeStart { is_inner: true, .. }) {
+        if let Token::AttributeStart { is_inner: true, is_tag } = self.token.token() {
+            // We have parsed the inner attribute start token `#![`.
+            // Disable the "skip whitespaces" flag only for tag attributes so that the next `self.bump()`
+            // does not consume the whitespace following the upcoming token.
+            if *is_tag {
+                self.set_lexer_skip_whitespaces_flag(false);
+            }
             let token = self.bump();
+            self.set_lexer_skip_whitespaces_flag(true);
             match token.into_token() {
                 Token::AttributeStart { is_tag, .. } => Some(is_tag),
                 _ => unreachable!(),
@@ -374,17 +394,6 @@ impl<'a> Parser<'a> {
 
     fn eat_comma(&mut self) -> bool {
         self.eat(Token::Comma)
-    }
-
-    fn eat_commas(&mut self) -> bool {
-        if self.eat_comma() {
-            while self.eat_comma() {
-                self.push_error(ParserErrorReason::UnexpectedComma, self.previous_token_location);
-            }
-            true
-        } else {
-            false
-        }
     }
 
     fn eat_semicolon(&mut self) -> bool {
@@ -402,6 +411,12 @@ impl<'a> Parser<'a> {
             true
         } else {
             false
+        }
+    }
+
+    fn eat_semicolon_or_error(&mut self) {
+        if !self.eat_semicolons() {
+            self.expected_token(Token::Semicolon);
         }
     }
 
@@ -478,6 +493,16 @@ impl<'a> Parser<'a> {
         self.at(Token::Keyword(keyword))
     }
 
+    fn at_whitespace(&self) -> bool {
+        matches!(self.token.token(), Token::Whitespace(_))
+    }
+
+    fn set_lexer_skip_whitespaces_flag(&mut self, flag: bool) {
+        if let TokenStream::Lexer(lexer) = &mut self.tokens {
+            lexer.set_skip_whitespaces_flag(flag);
+        };
+    }
+
     fn next_is(&self, token: Token) -> bool {
         self.next_token.token() == &token
     }
@@ -510,15 +535,22 @@ impl<'a> Parser<'a> {
     }
 
     fn location_at_previous_token_end(&self) -> Location {
-        Location::new(self.span_at_previous_token_end(), self.previous_token_location.file)
+        let span_at_previous_token_end = Span::from(
+            self.previous_token_location.span.end()..self.previous_token_location.span.end(),
+        );
+        Location::new(span_at_previous_token_end, self.previous_token_location.file)
     }
 
-    fn span_at_previous_token_end(&self) -> Span {
-        Span::from(self.previous_token_location.span.end()..self.previous_token_location.span.end())
+    fn unknown_ident_at_previous_token_end(&self) -> Ident {
+        Ident::new("(unknown)".to_string(), self.location_at_previous_token_end())
     }
 
     fn expected_identifier(&mut self) {
         self.expected_label(ParsingRuleLabel::Identifier);
+    }
+
+    fn expected_string(&mut self) {
+        self.expected_label(ParsingRuleLabel::String);
     }
 
     fn expected_token(&mut self, token: Token) {

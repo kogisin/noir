@@ -1,5 +1,5 @@
 use acvm::{AcirField, acir::brillig::MemoryAddress};
-use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::{BrilligContext, debug_show::DebugToString, registers::RegisterAllocator};
 
@@ -129,12 +129,12 @@ mod tests {
         FieldElement,
         acir::brillig::{MemoryAddress, Opcode},
     };
-    use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
+    use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
     use crate::{
         brillig::{
             BrilligOptions,
-            brillig_ir::{BrilligContext, artifact::Label, registers::Stack},
+            brillig_ir::{BrilligContext, LayoutConfig, artifact::Label, registers::Stack},
         },
         ssa::ir::function::FunctionId,
     };
@@ -211,8 +211,9 @@ mod tests {
             enable_debug_trace: true,
             enable_debug_assertions: true,
             enable_array_copy_counter: false,
+            layout: LayoutConfig::default(),
         };
-        let mut context = BrilligContext::new(&options);
+        let mut context = BrilligContext::new("test", &options);
         context.enter_context(Label::function(FunctionId::test_new(0)));
         context
     }

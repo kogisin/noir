@@ -12,7 +12,7 @@ use crate::ssa::ir::{
     value::{Value, ValueId},
 };
 
-use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::constant_allocation::ConstantAllocation;
 
@@ -49,7 +49,6 @@ pub(crate) fn collect_variables_of_value(
     value_id: ValueId,
     dfg: &DataFlowGraph,
 ) -> Option<ValueId> {
-    let value_id = dfg.resolve(value_id);
     let value = &dfg[value_id];
 
     match value {
@@ -180,9 +179,7 @@ impl VariableLiveness {
 
     fn compute_block_param_definitions(&mut self, func: &Function) {
         // Going in reverse post order to process the entry block first
-        let mut reverse_post_order = Vec::new();
-        reverse_post_order.extend_from_slice(self.post_order.as_slice());
-        reverse_post_order.reverse();
+        let reverse_post_order = self.post_order.clone().into_vec_reverse();
         for block in reverse_post_order {
             let params = func.dfg[block].parameters();
             // If it has no dominator, it's the entry block
@@ -246,13 +243,13 @@ impl VariableLiveness {
         let mut defined_vars = HashSet::default();
 
         for parameter in self.defined_block_params(&block_id) {
-            defined_vars.insert(dfg.resolve(parameter));
+            defined_vars.insert(parameter);
         }
 
         for instruction_id in block.instructions() {
             let result_values = dfg.instruction_results(*instruction_id);
             for result_value in result_values {
-                defined_vars.insert(dfg.resolve(*result_value));
+                defined_vars.insert(*result_value);
             }
         }
 
@@ -333,8 +330,8 @@ impl VariableLiveness {
 
 #[cfg(test)]
 mod test {
-    use fxhash::FxHashSet;
     use noirc_frontend::monomorphization::ast::InlineType;
+    use rustc_hash::FxHashSet;
 
     use crate::brillig::brillig_gen::constant_allocation::ConstantAllocation;
     use crate::brillig::brillig_gen::variable_liveness::VariableLiveness;
@@ -342,7 +339,7 @@ mod test {
     use crate::ssa::ir::function::RuntimeType;
     use crate::ssa::ir::instruction::BinaryOp;
     use crate::ssa::ir::map::Id;
-    use crate::ssa::ir::types::Type;
+    use crate::ssa::ir::types::{NumericType, Type};
 
     #[test]
     fn simple_back_propagation() {
@@ -442,11 +439,11 @@ mod test {
     #[test]
     fn propagation_with_nested_loops() {
         // brillig fn main f0 {
-        //     b0(v0: Field, v1: Field):
+        //     b0(v0: u32, v1: u32):
         //       v3 = allocate
-        //       store Field 0 at v3
-        //       jmp b1(Field 0)
-        //     b1(v4: Field):
+        //       store u32 0 at v3
+        //       jmp b1(u32 0)
+        //     b1(v4: u32):
         //       v5 = lt v4, v0
         //       jmpif v5 then: b2, else: b3
         //     b3():
@@ -455,14 +452,14 @@ mod test {
         //     b2():
         //       v6 = mul v4, v4
         //       jmp b4(v0)
-        //     b4(v7: Field):
+        //     b4(v7: u32):
         //       v8 = lt v7, v1
         //       jmpif v8 then: b5, else: b6
         //     b6():
-        //       v16 = add v4, Field 1
+        //       v16 = add v4, u32 1
         //       jmp b1(v16)
         //     b5():
-        //       v10 = eq v7, Field 27
+        //       v10 = eq v7, u32 27
         //       v11 = not v10
         //       jmpif v11 then: b7, else: b8
         //     b7():
@@ -471,7 +468,7 @@ mod test {
         //       store v13 at v3
         //       jmp b8()
         //     b8():
-        //       v15 = add v7, Field 1
+        //       v15 = add v7, u32 1
         //       jmp b4(v15)
         //   }
 
@@ -488,18 +485,18 @@ mod test {
         let b7 = builder.insert_block();
         let b8 = builder.insert_block();
 
-        let v0 = builder.add_parameter(Type::field());
-        let v1 = builder.add_parameter(Type::field());
+        let v0 = builder.add_parameter(Type::unsigned(32));
+        let v1 = builder.add_parameter(Type::unsigned(32));
 
-        let v3 = builder.insert_allocate(Type::field());
+        let v3 = builder.insert_allocate(Type::unsigned(32));
 
-        let zero = builder.field_constant(0u128);
+        let zero = builder.numeric_constant(0u128, NumericType::Unsigned { bit_size: 32 });
         builder.insert_store(v3, zero);
 
         builder.terminate_with_jmp(b1, vec![zero]);
 
         builder.switch_to_block(b1);
-        let v4 = builder.add_block_parameter(b1, Type::field());
+        let v4 = builder.add_block_parameter(b1, Type::unsigned(32));
 
         let v5 = builder.insert_binary(v4, BinaryOp::Lt, v0);
 
@@ -513,7 +510,7 @@ mod test {
 
         builder.switch_to_block(b4);
 
-        let v7 = builder.add_block_parameter(b4, Type::field());
+        let v7 = builder.add_block_parameter(b4, Type::unsigned(32));
 
         let v8 = builder.insert_binary(v7, BinaryOp::Lt, v1);
 
@@ -521,7 +518,7 @@ mod test {
 
         builder.switch_to_block(b5);
 
-        let twenty_seven = builder.field_constant(27u128);
+        let twenty_seven = builder.numeric_constant(27u128, NumericType::Unsigned { bit_size: 32 });
         let v10 = builder.insert_binary(v7, BinaryOp::Eq, twenty_seven);
 
         let v11 = builder.insert_not(v10);
@@ -530,7 +527,7 @@ mod test {
 
         builder.switch_to_block(b7);
 
-        let v12 = builder.insert_load(v3, Type::field());
+        let v12 = builder.insert_load(v3, Type::unsigned(32));
 
         let v13 = builder.insert_binary(v12, BinaryOp::Add { unchecked: false }, v6);
 
@@ -540,7 +537,7 @@ mod test {
 
         builder.switch_to_block(b8);
 
-        let one = builder.field_constant(1u128);
+        let one = builder.numeric_constant(1u128, NumericType::Unsigned { bit_size: 32 });
         let v15 = builder.insert_binary(v7, BinaryOp::Add { unchecked: false }, one);
 
         builder.terminate_with_jmp(b4, vec![v15]);
@@ -553,7 +550,7 @@ mod test {
 
         builder.switch_to_block(b3);
 
-        let v17 = builder.insert_load(v3, Type::field());
+        let v17 = builder.insert_load(v3, Type::unsigned(32));
 
         builder.terminate_with_return(vec![v17]);
 

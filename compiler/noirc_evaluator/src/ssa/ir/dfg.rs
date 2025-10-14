@@ -2,24 +2,26 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::ssa::{
     function_builder::data_bus::DataBus,
+    ir::instruction::ArrayOffset,
     opt::pure::{FunctionPurities, Purity},
 };
 
 use super::{
     basic_block::{BasicBlock, BasicBlockId},
-    call_stack::{CallStack, CallStackHelper, CallStackId},
     function::{FunctionId, RuntimeType},
     instruction::{
         Instruction, InstructionId, InstructionResultType, Intrinsic, TerminatorInstruction,
     },
+    integer::IntegerConstant,
     map::DenseMap,
     types::{NumericType, Type},
-    value::{Value, ValueId},
+    value::{Value, ValueId, ValueMapping},
 };
 
 use acvm::{FieldElement, acir::AcirField};
-use fxhash::FxHashMap as HashMap;
 use iter_extended::vecmap;
+use noirc_errors::call_stack::{CallStack, CallStackHelper, CallStackId};
+use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
@@ -84,13 +86,6 @@ pub(crate) struct DataFlowGraph {
     /// All blocks in a function
     blocks: DenseMap<BasicBlock>,
 
-    /// Debugging information about which `ValueId`s have had their underlying `Value` substituted
-    /// for that of another. In theory this information is purely used for printing the SSA,
-    /// and has no material effect on the SSA itself, however in practice the IDs can get out of
-    /// sync and may need this resolution before they can be compared.
-    #[serde(skip)]
-    replaced_value_ids: HashMap<ValueId, ValueId>,
-
     /// Source location of each instruction for debugging and issuing errors.
     ///
     /// The `CallStack` here corresponds to the entire callstack of locations. Initially this
@@ -113,6 +108,9 @@ pub(crate) struct DataFlowGraph {
 
     #[serde(skip)]
     pub(crate) function_purities: Arc<FunctionPurities>,
+
+    /// Indicate whether the Brillig array index offset optimizations have been performed.
+    pub(crate) brillig_arrays_offset: bool,
 }
 
 /// The GlobalsGraph contains the actual global data.
@@ -120,7 +118,7 @@ pub(crate) struct DataFlowGraph {
 /// The global's data will shared across functions and should be accessible inside of a function's DataFlowGraph.
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct GlobalsGraph {
+pub struct GlobalsGraph {
     /// Storage for all of the global values
     values: DenseMap<Value>,
     /// All of the instructions in the global value space.
@@ -197,16 +195,6 @@ impl DataFlowGraph {
         new_block
     }
 
-    /// Get an iterator over references to each basic block within the dfg, paired with the basic
-    /// block's id.
-    ///
-    /// The pairs are order by id, which is not guaranteed to be meaningful.
-    pub(crate) fn basic_blocks_iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (BasicBlockId, &BasicBlock)> {
-        self.blocks.iter()
-    }
-
     /// Iterate over every Value in this DFG in no particular order, including unused Values
     pub(crate) fn values_iter(&self) -> impl DoubleEndedIterator<Item = (ValueId, &Value)> {
         self.values.iter()
@@ -266,7 +254,7 @@ impl DataFlowGraph {
         block: BasicBlockId,
         ctrl_typevars: Option<Vec<Type>>,
         call_stack: CallStackId,
-    ) -> InsertInstructionResult {
+    ) -> InsertInstructionResult<'_> {
         if !self.is_handled_by_runtime(&instruction) {
             // Panicking to raise attention. If we're not supposed to simplify it immediately,
             // pushing the instruction would just cause a potential panic later on.
@@ -290,7 +278,7 @@ impl DataFlowGraph {
         block: BasicBlockId,
         ctrl_typevars: Option<Vec<Type>>,
         call_stack: CallStackId,
-    ) -> InsertInstructionResult {
+    ) -> InsertInstructionResult<'_> {
         self.insert_instruction_and_results_if_simplified(
             instruction,
             block,
@@ -308,7 +296,7 @@ impl DataFlowGraph {
         ctrl_typevars: Option<Vec<Type>>,
         call_stack: CallStackId,
         existing_id: Option<InstructionId>,
-    ) -> InsertInstructionResult {
+    ) -> InsertInstructionResult<'_> {
         if !self.is_handled_by_runtime(&instruction) {
             // BUG: With panicking it fails to build the `token_contract`; see:
             // https://github.com/AztecProtocol/aztec-packages/pull/11294#issuecomment-2624379102
@@ -316,7 +304,10 @@ impl DataFlowGraph {
             return InsertInstructionResult::InstructionRemoved;
         }
 
-        match simplify(&instruction, self, block, ctrl_typevars.clone(), call_stack) {
+        let simplify_result =
+            simplify(&instruction, self, block, ctrl_typevars.clone(), call_stack);
+
+        match simplify_result {
             SimplifyResult::SimplifiedTo(simplification) => {
                 InsertInstructionResult::SimplifiedTo(simplification)
             }
@@ -327,20 +318,29 @@ impl DataFlowGraph {
             result @ (SimplifyResult::SimplifiedToInstruction(_)
             | SimplifyResult::SimplifiedToInstructionMultiple(_)
             | SimplifyResult::None) => {
-                let instructions = result.instructions();
-                if instructions.is_none() {
+                let is_simplified = match &result {
+                    SimplifyResult::SimplifiedToInstruction(i) => {
+                        // `Binary` can simplify to itself instead of None.
+                        *i != instruction
+                    }
+                    SimplifyResult::SimplifiedToInstructionMultiple(is) => {
+                        // `Constrain` can simplify to a Multiple, with a single item of itself.
+                        is.len() != 1 || is[0] != instruction
+                    }
+                    SimplifyResult::None => false,
+                    _ => unreachable!("matched specific SimplifyResult types"),
+                };
+                if !is_simplified {
                     if let Some(id) = existing_id {
                         if self[id] == instruction {
                             // Just (re)insert into the block, no need to redefine.
                             self.blocks[block].insert_instruction(id);
-                            return InsertInstructionResult::Results(
-                                id,
-                                self.instruction_results(id),
-                            );
+                            let results = self.instruction_results(id);
+                            return InsertInstructionResult::Results(id, results);
                         }
                     }
                 }
-                let mut instructions = instructions.unwrap_or(vec![instruction]);
+                let mut instructions = result.instructions().unwrap_or(vec![instruction]);
                 assert!(
                     !instructions.is_empty(),
                     "`SimplifyResult::SimplifiedToInstructionMultiple` must not return empty vector"
@@ -383,16 +383,34 @@ impl DataFlowGraph {
         self.instructions[id] = instruction;
     }
 
-    /// Set the value of value_to_replace to refer to the value referred to by new_value.
-    ///
-    /// This is the preferred method to call for optimizations simplifying
-    /// values since other instructions referring to the same ValueId need
-    /// not be modified to refer to a new ValueId.
-    pub(crate) fn set_value_from_id(&mut self, value_to_replace: ValueId, new_value: ValueId) {
-        if value_to_replace != new_value {
-            self.replaced_value_ids.insert(value_to_replace, self.resolve(new_value));
-            let new_value = self.values[new_value].clone();
-            self.values[value_to_replace] = new_value;
+    /// Replaces values in the given block according to the given mapping.
+    pub(crate) fn replace_values_in_block(&mut self, block: BasicBlockId, mapping: &ValueMapping) {
+        self.replace_values_in_block_instructions(block, mapping);
+        self.replace_values_in_block_terminator(block, mapping);
+    }
+
+    /// Replaces values in the given block instructions according to the given mapping.
+    pub(crate) fn replace_values_in_block_instructions(
+        &mut self,
+        block: BasicBlockId,
+        mapping: &ValueMapping,
+    ) {
+        let instruction_ids = self.blocks[block].take_instructions();
+        for instruction_id in &instruction_ids {
+            let instruction = &mut self[*instruction_id];
+            instruction.replace_values(mapping);
+        }
+        *self[block].instructions_mut() = instruction_ids;
+    }
+
+    /// Replaces values in the given block terminator (if it has any) according to the given mapping.
+    pub(crate) fn replace_values_in_block_terminator(
+        &mut self,
+        block: BasicBlockId,
+        mapping: &ValueMapping,
+    ) {
+        if !mapping.is_empty() && self[block].terminator().is_some() {
+            self[block].unwrap_terminator_mut().map_values_mut(|value_id| mapping.get(value_id));
         }
     }
 
@@ -409,17 +427,6 @@ impl DataFlowGraph {
             _ => {
                 unreachable!("ICE: Cannot set type of {:?}", value);
             }
-        }
-    }
-
-    /// If `original_value_id`'s underlying `Value` has been substituted for that of another
-    /// `ValueId`, this function will return the `ValueId` from which the substitution was taken.
-    /// If `original_value_id`'s underlying `Value` has not been substituted, the same `ValueId`
-    /// is returned.
-    pub(crate) fn resolve(&self, original_value_id: ValueId) -> ValueId {
-        match self.replaced_value_ids.get(&original_value_id) {
-            Some(id) => self.resolve(*id),
-            None => original_value_id,
         }
     }
 
@@ -534,11 +541,11 @@ impl DataFlowGraph {
     /// Should `value` be a numeric constant then this function will return the exact number of bits required,
     /// otherwise it will return the minimum number of bits based on type information.
     pub(crate) fn get_value_max_num_bits(&self, value: ValueId) -> u32 {
-        match self[self.resolve(value)] {
+        match self[value] {
             Value::Instruction { instruction, .. } => {
                 let value_bit_size = self.type_of_value(value).bit_size();
                 if let Instruction::Cast(original_value, _) = self[instruction] {
-                    let original_bit_size = self.type_of_value(original_value).bit_size();
+                    let original_bit_size = self.get_value_max_num_bits(original_value);
                     // We might have cast e.g. `u1` to `u8` to be able to do arithmetic,
                     // in which case we want to recover the original smaller bit size;
                     // OTOH if we cast down, then we don't need the higher original size.
@@ -559,41 +566,39 @@ impl DataFlowGraph {
         matches!(self.values[value].get_type().as_ref(), Type::Reference(_))
     }
 
-    /// Replaces an instruction result with a fresh id.
-    pub(crate) fn replace_result(
-        &mut self,
-        instruction_id: InstructionId,
-        prev_value_id: ValueId,
-    ) -> ValueId {
-        let typ = self.type_of_value(prev_value_id);
-        let results = self.results.get_mut(&instruction_id).unwrap();
-        let res_position = results
-            .iter()
-            .position(|&id| id == prev_value_id)
-            .expect("Result id not found while replacing");
-
-        let value_id = self.values.insert(Value::Instruction {
-            typ,
-            position: res_position,
-            instruction: instruction_id,
-        });
-
-        // Replace the value in list of results for this instruction
-        results[res_position] = value_id;
-        value_id
-    }
-
     /// Returns all of result values which are attached to this instruction.
     pub(crate) fn instruction_results(&self, instruction_id: InstructionId) -> &[ValueId] {
         self.results.get(&instruction_id).expect("expected a list of Values").as_slice()
     }
 
+    /// Returns N results, asserting that there are exactly N items.
+    pub(crate) fn instruction_result<const N: usize>(
+        &self,
+        instruction_id: InstructionId,
+    ) -> [ValueId; N] {
+        let results = self.instruction_results(instruction_id);
+        if results.len() != N {
+            let instruction = &self[instruction_id];
+            panic!("expected {instruction:?} to have {N} results; got {}", results.len());
+        }
+        std::array::from_fn(|i| results[i])
+    }
+
     /// Remove an instruction by replacing it with a `Noop` instruction.
     /// Doing this avoids shifting over each instruction after this one in its block's instructions vector.
-    #[allow(unused)]
     pub(crate) fn remove_instruction(&mut self, instruction: InstructionId) {
         self.instructions[instruction] = Instruction::Noop;
         self.results.insert(instruction, smallvec::SmallVec::new());
+    }
+
+    /// Remove instructions for which the `keep` functions returns `false`.
+    pub(crate) fn retain_instructions(&mut self, keep: impl Fn(InstructionId) -> bool) {
+        for i in 0..self.instructions.len() {
+            let id = InstructionId::new(i as u32);
+            if !keep(id) {
+                self.remove_instruction(id);
+            }
+        }
     }
 
     /// Add a parameter to the given block
@@ -606,35 +611,38 @@ impl DataFlowGraph {
     }
 
     /// Returns the field element represented by this value if it is a numeric constant.
-    /// Returns None if the given value is not a numeric constant.
+    /// Returns `None` if the given value is not a numeric constant.
+    ///
+    /// Use `get_integer_constant` if the underlying values need to be compared as signed integers.
     pub(crate) fn get_numeric_constant(&self, value: ValueId) -> Option<FieldElement> {
         self.get_numeric_constant_with_type(value).map(|(value, _typ)| value)
     }
 
+    /// Similar to `get_numeric_constant` but returns the value as a signed or unsigned integer.
+    /// Returns `None` if the given value is not an integer constant.
+    pub(crate) fn get_integer_constant(&self, value: ValueId) -> Option<IntegerConstant> {
+        self.get_numeric_constant_with_type(value)
+            .and_then(|(f, t)| IntegerConstant::from_numeric_constant(f, t))
+    }
+
     /// Returns the field element and type represented by this value if it is a numeric constant.
-    /// Returns None if the given value is not a numeric constant.
+    /// Returns `None` if the given value is not a numeric constant.
     pub(crate) fn get_numeric_constant_with_type(
         &self,
         value: ValueId,
     ) -> Option<(FieldElement, NumericType)> {
-        match &self[self.resolve(value)] {
+        match &self[value] {
             Value::NumericConstant { constant, typ } => Some((*constant, *typ)),
             _ => None,
         }
     }
 
-    /// Returns the Value::Array associated with this ValueId if it refers to an array constant.
+    /// Returns the item values in with this ValueId if it refers to an array constant, along with the type of the array item.
     /// Otherwise, this returns None.
     pub(crate) fn get_array_constant(&self, value: ValueId) -> Option<(im::Vector<ValueId>, Type)> {
-        let value = self.resolve(value);
-        if let Some(instruction) = self.get_local_or_global_instruction(value) {
-            match instruction {
-                Instruction::MakeArray { elements, typ } => Some((elements.clone(), typ.clone())),
-                _ => None,
-            }
-        } else {
-            // Arrays are shared, so cloning them is cheap
-            None
+        match self.get_local_or_global_instruction(value)? {
+            Instruction::MakeArray { elements, typ } => Some((elements.clone(), typ.clone())),
+            _ => None,
         }
     }
 
@@ -670,22 +678,9 @@ impl DataFlowGraph {
         #[allow(clippy::match_like_matches_macro)]
         match (self.type_of_value(array), self.get_numeric_constant(index)) {
             (Type::Array(elements, len), Some(index))
-                if index.to_u128() < (len as u128 * elements.len() as u128) =>
+                if index.to_u128() < (u128::from(len) * elements.len() as u128) =>
             {
                 true
-            }
-            _ => false,
-        }
-    }
-
-    /// Arrays are represented as `[RC, ...items]` where RC stands for reference count.
-    /// By the time of Brillig generation we expect all constant indices
-    /// to already account for the extra offset from the RC.
-    pub(crate) fn is_safe_brillig_index(&self, index: ValueId, array: ValueId) -> bool {
-        #[allow(clippy::match_like_matches_macro)]
-        match (self.type_of_value(array), self.get_numeric_constant(index)) {
-            (Type::Array(elements, len), Some(index)) => {
-                (index.to_u128() - 1) < (len as u128 * elements.len() as u128)
             }
             _ => false,
         }
@@ -728,14 +723,14 @@ impl DataFlowGraph {
     }
 
     pub(crate) fn get_value_call_stack(&self, value: ValueId) -> CallStack {
-        match &self.values[self.resolve(value)] {
+        match &self.values[value] {
             Value::Instruction { instruction, .. } => self.get_instruction_call_stack(*instruction),
             _ => CallStack::new(),
         }
     }
 
     pub(crate) fn get_value_call_stack_id(&self, value: ValueId) -> CallStackId {
-        match &self.values[self.resolve(value)] {
+        match &self.values[value] {
             Value::Instruction { instruction, .. } => {
                 self.get_instruction_call_stack_id(*instruction)
             }
@@ -745,7 +740,6 @@ impl DataFlowGraph {
 
     /// True if the given ValueId refers to a (recursively) constant value
     pub(crate) fn is_constant(&self, argument: ValueId) -> bool {
-        let argument = self.resolve(argument);
         match &self[argument] {
             Value::Param { .. } => false,
             Value::Instruction { .. } => {
@@ -805,6 +799,32 @@ impl DataFlowGraph {
     pub(crate) fn purity_of(&self, function: FunctionId) -> Option<Purity> {
         self.function_purities.get(&function).copied()
     }
+
+    /// Determine the appropriate [ArrayOffset] to use for indexing an array or slice.
+    pub(crate) fn array_offset(&self, array: ValueId, index: ValueId) -> ArrayOffset {
+        if !self.runtime.is_brillig()
+            || !self.brillig_arrays_offset
+            || self.get_numeric_constant(index).is_none()
+        {
+            return ArrayOffset::None;
+        }
+        match self.type_of_value(array) {
+            Type::Array(_, _) => ArrayOffset::Array,
+            Type::Slice(_) => ArrayOffset::Slice,
+            _ => ArrayOffset::None,
+        }
+    }
+
+    /// Check if the results of an instruction are used in the databus to return a value..
+    ///
+    /// This only applies to ACIR, as in Brillig the databus will always be empty.
+    pub(crate) fn is_returned_in_databus(&self, instruction_id: InstructionId) -> bool {
+        let Some(return_data) = self.data_bus.return_data else {
+            return false;
+        };
+        let results = self.instruction_results(instruction_id);
+        results.iter().any(|id| *id == return_data)
+    }
 }
 
 impl std::ops::Index<InstructionId> for DataFlowGraph {
@@ -863,7 +883,7 @@ impl std::ops::Index<InstructionId> for GlobalsGraph {
 // be a list of results or a single ValueId if the instruction was simplified
 // to an existing value.
 #[derive(Debug)]
-pub(crate) enum InsertInstructionResult<'dfg> {
+pub enum InsertInstructionResult<'dfg> {
     /// Results is the standard case containing the instruction id and the results of that instruction.
     Results(InstructionId, &'dfg [ValueId]),
     SimplifiedTo(ValueId),

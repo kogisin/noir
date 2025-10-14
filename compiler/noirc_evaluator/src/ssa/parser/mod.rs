@@ -13,7 +13,7 @@ use super::{
     opt::pure::Purity,
 };
 
-use acvm::{AcirField, FieldElement};
+use acvm::FieldElement;
 use ast::{
     AssertMessage, Identifier, ParsedBlock, ParsedFunction, ParsedGlobal, ParsedGlobalValue,
     ParsedInstruction, ParsedMakeArray, ParsedNumericConstant, ParsedParameter, ParsedSsa,
@@ -21,11 +21,16 @@ use ast::{
 };
 use lexer::{Lexer, LexerError};
 use noirc_errors::Span;
-use noirc_frontend::{monomorphization::ast::InlineType, token::IntType};
+use noirc_frontend::{
+    monomorphization::ast::InlineType, signed_field::SignedField, token::IntType,
+};
 use thiserror::Error;
 use token::{Keyword, SpannedToken, Token};
 
-use crate::ssa::{ir::function::RuntimeType, parser::ast::ParsedTerminator};
+use crate::ssa::{
+    ir::{function::RuntimeType, instruction::ArrayOffset},
+    parser::ast::{ParsedCallData, ParsedDataBus, ParsedTerminator},
+};
 
 mod ast;
 mod into_ssa;
@@ -37,34 +42,40 @@ impl FromStr for Ssa {
     type Err = SsaErrorWithSource;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_str_impl(s, false)
+        Self::from_str_impl(s, false, true)
     }
 }
 
 impl Ssa {
     /// Creates an Ssa object from the given string.
-    pub(crate) fn from_str(src: &str) -> Result<Ssa, SsaErrorWithSource> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(src: &str) -> Result<Ssa, SsaErrorWithSource> {
         FromStr::from_str(src)
+    }
+
+    /// Creates an Ssa object from the given string without running SSA validation
+    pub fn from_str_no_validation(src: &str) -> Result<Ssa, SsaErrorWithSource> {
+        Self::from_str_impl(src, false, false)
     }
 
     /// Creates an Ssa object from the given string but trying to simplify
     /// each parsed instruction as it's inserted into the final SSA.
-    pub(crate) fn from_str_simplifying(src: &str) -> Result<Ssa, SsaErrorWithSource> {
-        Self::from_str_impl(src, true)
+    pub fn from_str_simplifying(src: &str) -> Result<Ssa, SsaErrorWithSource> {
+        Self::from_str_impl(src, true, true)
     }
 
-    fn from_str_impl(src: &str, simplify: bool) -> Result<Ssa, SsaErrorWithSource> {
+    fn from_str_impl(src: &str, simplify: bool, validate: bool) -> Result<Ssa, SsaErrorWithSource> {
         let mut parser =
             Parser::new(src).map_err(|err| SsaErrorWithSource::parse_error(err, src))?;
         let parsed_ssa =
             parser.parse_ssa().map_err(|err| SsaErrorWithSource::parse_error(err, src))?;
         parsed_ssa
-            .into_ssa(simplify)
+            .into_ssa(simplify, validate)
             .map_err(|error| SsaErrorWithSource { src: src.to_string(), error })
     }
 }
 
-pub(crate) struct SsaErrorWithSource {
+pub struct SsaErrorWithSource {
     src: String,
     error: SsaError,
 }
@@ -87,7 +98,7 @@ impl Debug for SsaErrorWithSource {
                 writeln!(f)?;
             }
 
-            writeln!(f, "{}", line)?;
+            writeln!(f, "{line}")?;
 
             if has_error {
                 let offset = span.start() as usize - byte;
@@ -122,6 +133,8 @@ pub(crate) enum SsaError {
     VariableAlreadyDefined(Identifier),
     #[error("Global '{0}' already defined")]
     GlobalAlreadyDefined(Identifier),
+    #[error("Illegal use of offset in non-Brillig function '{0:?}'")]
+    IllegalOffset(Identifier, ArrayOffset),
 }
 
 impl SsaError {
@@ -133,7 +146,8 @@ impl SsaError {
             | SsaError::UnknownBlock(identifier)
             | SsaError::VariableAlreadyDefined(identifier)
             | SsaError::GlobalAlreadyDefined(identifier)
-            | SsaError::UnknownFunction(identifier) => identifier.span,
+            | SsaError::UnknownFunction(identifier)
+            | SsaError::IllegalOffset(identifier, _) => identifier.span,
             SsaError::MismatchedReturnValues { returns, expected: _ } => returns[0].span,
         }
     }
@@ -196,16 +210,17 @@ impl<'a> Parser<'a> {
 
         self.eat_or_error(Token::Keyword(Keyword::Fn))?;
 
-        let external_name = self.eat_ident_or_error()?;
+        let external_name = self.eat_ident_or_keyword_or_error()?;
         let internal_name = self.eat_ident_or_error()?;
 
         self.eat_or_error(Token::LeftBrace)?;
 
+        let data_bus = self.parse_data_bus()?;
         let blocks = self.parse_blocks()?;
 
         self.eat_or_error(Token::RightBrace)?;
 
-        Ok(ParsedFunction { runtime_type, purity, external_name, internal_name, blocks })
+        Ok(ParsedFunction { runtime_type, purity, external_name, internal_name, data_bus, blocks })
     }
 
     fn parse_runtime_type(&mut self) -> ParseResult<RuntimeType> {
@@ -260,6 +275,80 @@ impl<'a> Parser<'a> {
                 Token::Keyword(Keyword::NoPredicates),
             ])
         }
+    }
+
+    fn parse_data_bus(&mut self) -> ParseResult<ParsedDataBus> {
+        let call_data = self.parse_call_data_vec()?;
+        let return_data = self.parse_return_data()?;
+        Ok(ParsedDataBus { call_data, return_data })
+    }
+
+    fn parse_call_data_vec(&mut self) -> ParseResult<Vec<ParsedCallData>> {
+        let mut call_data_vec = Vec::new();
+        while let Some(call_data) = self.parse_call_data()? {
+            call_data_vec.push(call_data);
+        }
+        Ok(call_data_vec)
+    }
+
+    fn parse_call_data(&mut self) -> ParseResult<Option<ParsedCallData>> {
+        // call_data(id):
+        if !self.eat_keyword(Keyword::CallData)? {
+            return Ok(None);
+        }
+        self.eat_or_error(Token::LeftParen)?;
+        let call_data_id_span = self.token.span();
+        let call_data_id = self.eat_int_or_error()?;
+        let Some(call_data_id) = call_data_id.try_to_unsigned::<u32>() else {
+            return Err(ParserError::ExpectedU32 { found: call_data_id, span: call_data_id_span });
+        };
+        self.eat_or_error(Token::RightParen)?;
+        self.eat_or_error(Token::Colon)?;
+
+        // array: value,
+        self.eat_keyword_or_error(Keyword::Array)?;
+        self.eat_or_error(Token::Colon)?;
+        let array = self.parse_value_or_error()?;
+        self.eat_or_error(Token::Comma)?;
+
+        let mut index_map = Vec::new();
+
+        // indexes: [value: id, ...]
+        self.eat_keyword_or_error(Keyword::Indices)?;
+        self.eat_or_error(Token::Colon)?;
+        self.eat_or_error(Token::LeftBracket)?;
+
+        if !self.eat(Token::RightBracket)? {
+            loop {
+                let value = self.parse_value_or_error()?;
+                self.eat_or_error(Token::Colon)?;
+                let index_span = self.token.span();
+                let index = self.eat_int_or_error()?;
+                let Some(index) = index.try_to_unsigned::<usize>() else {
+                    return Err(ParserError::ExpectedUSize { found: index, span: index_span });
+                };
+                index_map.push((value, index));
+
+                if self.eat(Token::Comma)? {
+                    continue;
+                }
+
+                self.eat_or_error(Token::RightBracket)?;
+                break;
+            }
+        }
+
+        Ok(Some(ParsedCallData { call_data_id, array, index_map }))
+    }
+
+    fn parse_return_data(&mut self) -> ParseResult<Option<ParsedValue>> {
+        if !self.eat_keyword(Keyword::ReturnData)? {
+            return Ok(None);
+        }
+
+        self.eat_or_error(Token::Colon)?;
+        let value = self.parse_value_or_error()?;
+        Ok(Some(value))
     }
 
     fn parse_blocks(&mut self) -> ParseResult<Vec<ParsedBlock>> {
@@ -332,6 +421,10 @@ impl<'a> Parser<'a> {
         }
 
         if let Some(instruction) = self.parse_store()? {
+            return Ok(Some(instruction));
+        }
+
+        if let Some(instruction) = self.parse_nop()? {
             return Ok(Some(instruction));
         }
 
@@ -442,9 +535,18 @@ impl<'a> Parser<'a> {
 
         let value = self.parse_value_or_error()?;
         self.eat_or_error(Token::Keyword(Keyword::To))?;
-        let max_bit_size = self.eat_int_or_error()?.to_u128() as u32;
+        let max_bit_size = self.eat_int_or_error()?.try_to_unsigned::<u32>().ok_or(
+            ParserError::InvalidInteger {
+                found: self.token.token().clone(),
+                span: self.token.span(),
+            },
+        )?;
         self.eat_or_error(Token::Keyword(Keyword::Bits))?;
-        Ok(Some(ParsedInstruction::RangeCheck { value, max_bit_size }))
+
+        let assert_message =
+            if self.eat(Token::Comma)? { Some(self.eat_str_or_error()?) } else { None };
+
+        Ok(Some(ParsedInstruction::RangeCheck { value, max_bit_size, assert_message }))
     }
 
     fn parse_store(&mut self) -> ParseResult<Option<ParsedInstruction>> {
@@ -456,6 +558,14 @@ impl<'a> Parser<'a> {
         self.eat_or_error(Token::Keyword(Keyword::At))?;
         let address = self.parse_value_or_error()?;
         Ok(Some(ParsedInstruction::Store { address, value }))
+    }
+
+    fn parse_nop(&mut self) -> ParseResult<Option<ParsedInstruction>> {
+        if !self.eat_keyword(Keyword::Nop)? {
+            return Ok(None);
+        }
+
+        Ok(Some(ParsedInstruction::Nop))
     }
 
     fn parse_assignment(&mut self, target: Identifier) -> ParseResult<ParsedInstruction> {
@@ -495,9 +605,10 @@ impl<'a> Parser<'a> {
             self.eat_or_error(Token::Comma)?;
             self.eat_or_error(Token::Keyword(Keyword::Index))?;
             let index = self.parse_value_or_error()?;
+            let offset = self.parse_array_offset()?;
             self.eat_or_error(Token::Arrow)?;
             let element_type = self.parse_type()?;
-            return Ok(ParsedInstruction::ArrayGet { target, element_type, array, index });
+            return Ok(ParsedInstruction::ArrayGet { target, element_type, array, index, offset });
         }
 
         if self.eat_keyword(Keyword::ArraySet)? {
@@ -506,10 +617,18 @@ impl<'a> Parser<'a> {
             self.eat_or_error(Token::Comma)?;
             self.eat_or_error(Token::Keyword(Keyword::Index))?;
             let index = self.parse_value_or_error()?;
+            let offset = self.parse_array_offset()?;
             self.eat_or_error(Token::Comma)?;
             self.eat_or_error(Token::Keyword(Keyword::Value))?;
             let value = self.parse_value_or_error()?;
-            return Ok(ParsedInstruction::ArraySet { target, array, index, value, mutable });
+            return Ok(ParsedInstruction::ArraySet {
+                target,
+                array,
+                index,
+                value,
+                mutable,
+                offset,
+            });
         }
 
         if self.eat_keyword(Keyword::Cast)? {
@@ -542,13 +661,42 @@ impl<'a> Parser<'a> {
         if self.eat_keyword(Keyword::Truncate)? {
             let value = self.parse_value_or_error()?;
             self.eat_or_error(Token::Keyword(Keyword::To))?;
-            let bit_size = self.eat_int_or_error()?.to_u128() as u32;
+            let bit_size = self.eat_int_or_error()?.try_to_unsigned::<u32>().ok_or(
+                ParserError::InvalidInteger {
+                    found: self.token.token().clone(),
+                    span: self.token.span(),
+                },
+            )?;
             self.eat_or_error(Token::Keyword(Keyword::Bits))?;
             self.eat_or_error(Token::Comma)?;
             self.eat_or_error(Token::Keyword(Keyword::MaxBitSize))?;
             self.eat_or_error(Token::Colon)?;
-            let max_bit_size = self.eat_int_or_error()?.to_u128() as u32;
+            let max_bit_size = self.eat_int_or_error()?.try_to_unsigned::<u32>().ok_or(
+                ParserError::InvalidInteger {
+                    found: self.token.token().clone(),
+                    span: self.token.span(),
+                },
+            )?;
             return Ok(ParsedInstruction::Truncate { target, value, bit_size, max_bit_size });
+        }
+
+        if self.eat_keyword(Keyword::If)? {
+            let then_condition = self.parse_value_or_error()?;
+            self.eat_or_error(Token::Keyword(Keyword::Then))?;
+            let then_value = self.parse_value_or_error()?;
+            self.eat_or_error(Token::Keyword(Keyword::Else))?;
+            self.eat_or_error(Token::LeftParen)?;
+            self.eat_or_error(Token::Keyword(Keyword::If))?;
+            let else_condition = self.parse_value_or_error()?;
+            self.eat_or_error(Token::RightParen)?;
+            let else_value = self.parse_value_or_error()?;
+            return Ok(ParsedInstruction::IfElse {
+                target,
+                then_condition,
+                then_value,
+                else_condition,
+                else_value,
+            });
         }
 
         if let Some(op) = self.eat_binary_op()? {
@@ -559,6 +707,25 @@ impl<'a> Parser<'a> {
         }
 
         self.expected_instruction_or_terminator()
+    }
+
+    fn parse_array_offset(&mut self) -> ParseResult<ArrayOffset> {
+        if self.eat_keyword(Keyword::Minus)? {
+            let token = self.token.token().clone();
+            let span = self.token.span();
+            let field = self.eat_int_or_error()?;
+            if let Some(offset) = field.try_to_unsigned::<u32>().and_then(ArrayOffset::from_u32) {
+                if offset == ArrayOffset::None {
+                    self.unexpected_offset(token, span)
+                } else {
+                    Ok(offset)
+                }
+            } else {
+                self.unexpected_offset(token, span)
+            }
+        } else {
+            Ok(ArrayOffset::None)
+        }
     }
 
     fn parse_make_array(&mut self) -> ParseResult<Option<ParsedMakeArray>> {
@@ -576,7 +743,7 @@ impl<'a> Parser<'a> {
                 .bytes()
                 .map(|byte| {
                     ParsedValue::NumericConstant(ParsedNumericConstant {
-                        value: FieldElement::from(byte as u128),
+                        value: FieldElement::from(u128::from(byte)),
                         typ: u8.clone(),
                     })
                 })
@@ -589,7 +756,7 @@ impl<'a> Parser<'a> {
                 .bytes()
                 .map(|byte| {
                     ParsedValue::NumericConstant(ParsedNumericConstant {
-                        value: FieldElement::from(byte as u128),
+                        value: FieldElement::from(u128::from(byte)),
                         typ: u8.clone(),
                     })
                 })
@@ -617,6 +784,10 @@ impl<'a> Parser<'a> {
         }
 
         if let Some(terminator) = self.parse_jmpif()? {
+            return Ok(terminator);
+        }
+
+        if let Some(terminator) = self.parse_unreachable()? {
             return Ok(terminator);
         }
 
@@ -673,6 +844,14 @@ impl<'a> Parser<'a> {
         Ok(Some(ParsedTerminator::Jmpif { condition, then_block, else_block }))
     }
 
+    fn parse_unreachable(&mut self) -> ParseResult<Option<ParsedTerminator>> {
+        if !self.eat_keyword(Keyword::Unreachable)? {
+            return Ok(None);
+        }
+
+        Ok(Some(ParsedTerminator::Unreachable))
+    }
+
     fn parse_arguments(&mut self) -> ParseResult<Vec<ParsedValue>> {
         self.eat_or_error(Token::LeftParen)?;
         let arguments = self.parse_comma_separated_values()?;
@@ -721,7 +900,7 @@ impl<'a> Parser<'a> {
 
     fn parse_field_value(&mut self) -> ParseResult<Option<ParsedNumericConstant>> {
         if self.eat_keyword(Keyword::Field)? {
-            let value = self.eat_int_or_error()?;
+            let value = self.eat_int_or_error()?.to_field_element();
             Ok(Some(ParsedNumericConstant { value, typ: Type::field() }))
         } else {
             Ok(None)
@@ -734,6 +913,12 @@ impl<'a> Parser<'a> {
             let typ = match int_type {
                 IntType::Unsigned(bit_size) => Type::unsigned(bit_size),
                 IntType::Signed(bit_size) => Type::signed(bit_size),
+            };
+            let value = if typ.is_signed() && value.is_negative() {
+                // 2-complement representation:
+                FieldElement::from(2u128.pow(typ.bit_size())) - value.absolute_value()
+            } else {
+                value.absolute_value()
             };
             Ok(Some(ParsedNumericConstant { value, typ }))
         } else {
@@ -784,7 +969,7 @@ impl<'a> Parser<'a> {
             if self.eat(Token::Semicolon)? {
                 let length = self.eat_int_or_error()?;
                 self.eat_or_error(Token::RightBracket)?;
-                return Ok(Type::Array(Arc::new(element_types), length.to_u128() as u32));
+                return Ok(Type::Array(Arc::new(element_types), length.try_to_unsigned().unwrap()));
             } else {
                 self.eat_or_error(Token::RightBracket)?;
                 return Ok(Type::Slice(Arc::new(element_types)));
@@ -852,6 +1037,14 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn eat_keyword_or_error(&mut self, keyword: Keyword) -> ParseResult<()> {
+        if self.eat_keyword(keyword)? {
+            Ok(())
+        } else {
+            self.expected_token(Token::Keyword(keyword))
+        }
+    }
+
     fn eat_ident(&mut self) -> ParseResult<Option<String>> {
         if !matches!(self.token.token(), Token::Ident(..)) {
             return Ok(None);
@@ -868,18 +1061,25 @@ impl<'a> Parser<'a> {
         if let Some(ident) = self.eat_ident()? { Ok(ident) } else { self.expected_identifier() }
     }
 
-    fn eat_int(&mut self) -> ParseResult<Option<FieldElement>> {
+    fn eat_ident_or_keyword_or_error(&mut self) -> ParseResult<String> {
+        if let Some(ident) = self.eat_ident()? {
+            Ok(ident)
+        } else if let Token::Keyword(keyword) = self.token.token() {
+            let ident = keyword.to_string();
+            self.bump()?;
+            Ok(ident)
+        } else {
+            self.expected_identifier()
+        }
+    }
+
+    fn eat_int(&mut self) -> ParseResult<Option<SignedField>> {
         let negative = self.eat(Token::Dash)?;
 
         if matches!(self.token.token(), Token::Int(..)) {
             let token = self.bump()?;
             match token.into_token() {
-                Token::Int(mut int) => {
-                    if negative {
-                        int = -int;
-                    }
-                    Ok(Some(int))
-                }
+                Token::Int(int) => Ok(Some(SignedField::new(int, negative))),
                 _ => unreachable!(),
             }
         } else {
@@ -887,7 +1087,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn eat_int_or_error(&mut self) -> ParseResult<FieldElement> {
+    fn eat_int_or_error(&mut self) -> ParseResult<SignedField> {
         if let Some(int) = self.eat_int()? { Ok(int) } else { self.expected_int() }
     }
 
@@ -914,6 +1114,10 @@ impl<'a> Parser<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    fn eat_str_or_error(&mut self) -> ParseResult<String> {
+        if let Some(message) = self.eat_str()? { Ok(message) } else { self.expected_string() }
     }
 
     fn eat_byte_str(&mut self) -> ParseResult<Option<String>> {
@@ -965,6 +1169,13 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn expected_string<T>(&mut self) -> ParseResult<T> {
+        Err(ParserError::ExpectedString {
+            found: self.token.token().clone(),
+            span: self.token.span(),
+        })
+    }
+
     fn expected_string_or_data<T>(&mut self) -> ParseResult<T> {
         Err(ParserError::ExpectedStringOrData {
             found: self.token.token().clone(),
@@ -988,6 +1199,10 @@ impl<'a> Parser<'a> {
 
     fn expected_int<T>(&mut self) -> ParseResult<T> {
         Err(ParserError::ExpectedInt { found: self.token.token().clone(), span: self.token.span() })
+    }
+
+    fn unexpected_offset<T>(&mut self, found: Token, span: Span) -> ParseResult<T> {
+        Err(ParserError::UnexpectedOffset { found, span })
     }
 
     fn expected_type<T>(&mut self) -> ParseResult<T> {
@@ -1044,6 +1259,8 @@ pub(crate) enum ParserError {
     ExpectedType { found: Token, span: Span },
     #[error("Expected an instruction or terminator, found '{found}'")]
     ExpectedInstructionOrTerminator { found: Token, span: Span },
+    #[error("Expected a string literal, found '{found}'")]
+    ExpectedString { found: Token, span: Span },
     #[error("Expected a string literal or 'data', found '{found}'")]
     ExpectedStringOrData { found: Token, span: Span },
     #[error("Expected a byte string literal, found '{found}'")]
@@ -1054,8 +1271,16 @@ pub(crate) enum ParserError {
         "Expected a global value (Field literal, integer literal or make_array), found '{found}'"
     )]
     ExpectedGlobalValue { found: Token, span: Span },
+    #[error("Expected a u32, found '{found}'")]
+    ExpectedU32 { found: SignedField, span: Span },
+    #[error("Expected a usize, found '{found}'")]
+    ExpectedUSize { found: SignedField, span: Span },
     #[error("Multiple return values only allowed for call")]
     MultipleReturnValuesOnlyAllowedForCall { second_target: Identifier },
+    #[error("Unexpected integer value for array_get offset")]
+    UnexpectedOffset { found: Token, span: Span },
+    #[error("Invalid integer value")]
+    InvalidInteger { found: Token, span: Span },
 }
 
 impl ParserError {
@@ -1068,10 +1293,16 @@ impl ParserError {
             | ParserError::ExpectedInt { span, .. }
             | ParserError::ExpectedType { span, .. }
             | ParserError::ExpectedInstructionOrTerminator { span, .. }
+            | ParserError::ExpectedString { span, .. }
             | ParserError::ExpectedStringOrData { span, .. }
             | ParserError::ExpectedByteString { span, .. }
             | ParserError::ExpectedValue { span, .. }
-            | ParserError::ExpectedGlobalValue { span, .. } => *span,
+            | ParserError::ExpectedGlobalValue { span, .. }
+            | ParserError::ExpectedU32 { span, .. }
+            | ParserError::ExpectedUSize { span, .. }
+            | ParserError::UnexpectedOffset { span, .. }
+            | ParserError::InvalidInteger { span, .. } => *span,
+
             ParserError::MultipleReturnValuesOnlyAllowedForCall { second_target, .. } => {
                 second_target.span
             }

@@ -8,6 +8,7 @@ use crate::ssa::ir::function::{Function, FunctionId};
 use crate::ssa::ir::instruction::{Hint, Instruction, InstructionId, Intrinsic};
 use crate::ssa::ir::value::{Value, ValueId};
 use crate::ssa::ssa_gen::Ssa;
+use crate::ssa::visit_once_deque::VisitOnceDeque;
 use im::HashMap;
 use noirc_errors::Location;
 use rayon::prelude::*;
@@ -154,13 +155,11 @@ impl BrilligTaintedIds {
             .iter()
             .filter(|value| function.dfg.get_numeric_constant(**value).is_none())
             .copied()
-            .map(|value| function.dfg.resolve(value))
             .collect();
         let results: Vec<ValueId> = results
             .iter()
             .filter(|value| function.dfg.get_numeric_constant(**value).is_none())
             .copied()
-            .map(|value| function.dfg.resolve(value))
             .collect();
 
         let mut results_status: Vec<ResultStatus> = vec![];
@@ -391,7 +390,7 @@ impl DependencyContext {
             // Collect non-constant instruction arguments
             function.dfg[*instruction].for_each_value(|value_id| {
                 if function.dfg.get_numeric_constant(value_id).is_none() {
-                    arguments.push(function.dfg.resolve(value_id));
+                    arguments.push(value_id);
                 }
             });
 
@@ -420,7 +419,7 @@ impl DependencyContext {
                 // Collect non-constant instruction results
                 for value_id in function.dfg.instruction_results(*instruction).iter() {
                     if function.dfg.get_numeric_constant(*value_id).is_none() {
-                        results.push(function.dfg.resolve(*value_id));
+                        results.push(*value_id);
                     }
                 }
 
@@ -428,7 +427,7 @@ impl DependencyContext {
                     // For memory operations, we have to link up the stored value as a parent
                     // of one loaded from the same memory slot
                     Instruction::Store { address, value } => {
-                        self.memory_slots.insert(*address, function.dfg.resolve(*value));
+                        self.memory_slots.insert(*address, *value);
                     }
                     Instruction::Load { address } => {
                         // Recall the value stored at address as parent for the results
@@ -436,8 +435,7 @@ impl DependencyContext {
                             self.update_children(&[*value_id], &results);
                         } else {
                             panic!(
-                                "load instruction {} has attempted to access previously unused memory location",
-                                instruction
+                                "load instruction {instruction} has attempted to access previously unused memory location"
                             );
                         }
                     }
@@ -445,7 +443,7 @@ impl DependencyContext {
                     Instruction::EnableSideEffectsIf { condition: value } => {
                         self.side_effects_condition =
                             match function.dfg.get_numeric_constant(*value) {
-                                None => Some(function.dfg.resolve(*value)),
+                                None => Some(*value),
                                 Some(_) => None,
                             }
                     }
@@ -453,14 +451,11 @@ impl DependencyContext {
                     // involved in Brillig calls, remove covered calls
                     Instruction::Constrain(value_id1, value_id2, _)
                     | Instruction::ConstrainNotEqual(value_id1, value_id2, _) => {
-                        self.clear_constrained(
-                            &[function.dfg.resolve(*value_id1), function.dfg.resolve(*value_id2)],
-                            function,
-                        );
+                        self.clear_constrained(&[*value_id1, *value_id2], function);
                     }
                     // Consider range check to also be constraining
                     Instruction::RangeCheck { value, .. } => {
-                        self.clear_constrained(&[function.dfg.resolve(*value)], function);
+                        self.clear_constrained(&[*value], function);
                     }
                     Instruction::Call { func: func_id, .. } => {
                         // For functions, we remove the first element of arguments,
@@ -542,7 +537,7 @@ impl DependencyContext {
                         self.update_children(&arguments, &results);
                     }
                     // These instructions won't affect the dependency graph
-                    Instruction::Allocate { .. }
+                    Instruction::Allocate
                     | Instruction::DecrementRc { .. }
                     | Instruction::IncrementRc { .. }
                     | Instruction::MakeArray { .. }
@@ -656,8 +651,7 @@ impl DependencyContext {
 
 #[derive(Default)]
 struct Context {
-    visited_blocks: HashSet<BasicBlockId>,
-    block_queue: Vec<BasicBlockId>,
+    block_queue: VisitOnceDeque,
     value_sets: Vec<BTreeSet<ValueId>>,
     brillig_return_to_argument: HashMap<ValueId, Vec<ValueId>>,
     brillig_return_to_instruction_id: HashMap<ValueId, InstructionId>,
@@ -673,12 +667,8 @@ impl Context {
         all_functions: &BTreeMap<FunctionId, Function>,
     ) {
         // Go through each block in the function and create a list of sets of ValueIds connected by instructions
-        self.block_queue.push(function.entry_block());
-        while let Some(block) = self.block_queue.pop() {
-            if self.visited_blocks.contains(&block) {
-                continue;
-            }
-            self.visited_blocks.insert(block);
+        self.block_queue.push_back(function.entry_block());
+        while let Some(block) = self.block_queue.pop_back() {
             self.connect_value_ids_in_block(function, block, all_functions);
         }
         // Merge ValueIds into sets, where each original small set of ValueIds is merged with another set if they intersect
@@ -692,13 +682,12 @@ impl Context {
         &mut self,
         function: &Function,
     ) -> BTreeSet<usize> {
-        let returns = function.returns();
+        let returns = function.returns().unwrap_or_default();
         let variable_parameters_and_return_values = function
             .parameters()
             .iter()
             .chain(returns)
-            .filter(|id| function.dfg.get_numeric_constant(**id).is_none())
-            .map(|value_id| function.dfg.resolve(*value_id));
+            .filter(|id| function.dfg.get_numeric_constant(**id).is_none());
 
         let mut connected_sets_indices: BTreeSet<usize> = BTreeSet::default();
 
@@ -706,7 +695,7 @@ impl Context {
         // If it's the case, then that set doesn't present an issue
         for parameter_or_return_value in variable_parameters_and_return_values {
             for (set_index, final_set) in self.value_sets.iter().enumerate() {
-                if final_set.contains(&parameter_or_return_value) {
+                if final_set.contains(parameter_or_return_value) {
                     connected_sets_indices.insert(set_index);
                 }
             }
@@ -762,13 +751,13 @@ impl Context {
             // Insert non-constant instruction arguments
             function.dfg[*instruction].for_each_value(|value_id| {
                 if function.dfg.get_numeric_constant(value_id).is_none() {
-                    instruction_arguments_and_results.insert(function.dfg.resolve(value_id));
+                    instruction_arguments_and_results.insert(value_id);
                 }
             });
             // And non-constant results
             for value_id in function.dfg.instruction_results(*instruction).iter() {
                 if function.dfg.get_numeric_constant(*value_id).is_none() {
-                    instruction_arguments_and_results.insert(function.dfg.resolve(*value_id));
+                    instruction_arguments_and_results.insert(*value_id);
                 }
             }
 
@@ -855,7 +844,7 @@ impl Context {
                         }
                     }
                 }
-                Instruction::Allocate { .. }
+                Instruction::Allocate
                 | Instruction::DecrementRc { .. }
                 | Instruction::EnableSideEffectsIf { .. }
                 | Instruction::IncrementRc { .. }
@@ -1039,7 +1028,7 @@ mod test {
             inc_rc v4
             inc_rc v5
             v8 = call f1(v4) -> u32
-            v9 = allocate -> &mut u32
+            v9 = allocate -> &mut u1
             store u1 0 at v9
             v10 = load v9 -> u1
             v11 = array_get v4, index u32 0 -> u32

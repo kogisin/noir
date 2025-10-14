@@ -7,40 +7,37 @@ use acir::{
     },
     native_types::{Expression, Witness},
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
-
-#[derive(PartialEq)]
-enum BlockStatus {
-    Initialized,
-    Used,
-}
+use std::collections::HashSet;
 
 /// Simulate a symbolic solve for a circuit
+/// Instead of evaluating witness values from the inputs, like the PWG module is doing,
+/// this pass simply mark the witness that can be evaluated, from the known inputs,
+/// and incrementally from the previously marked witnesses.
+/// This avoid any computation on a big field which makes the process efficient.
+/// When all the witness of an opcode are marked as solvable, it means that the
+/// opcode is solvable.
 #[derive(Default)]
 pub struct CircuitSimulator {
     /// Track the witnesses that can be solved
     solvable_witness: HashSet<Witness>,
 
-    /// Tells whether a Memory Block is:
-    /// - Not initialized if not in the map
-    /// - Initialized if its status is Initialized in the Map
-    /// - Used, indicating that the block cannot be written anymore.
-    resolved_blocks: HashMap<BlockId, BlockStatus>,
+    /// Track whether a [`BlockId`] has been initialized
+    initialized_blocks: HashSet<BlockId>,
 }
 
 impl CircuitSimulator {
     /// Simulate a symbolic solve for a circuit by keeping track of the witnesses that can be solved.
-    /// Returns false if the circuit cannot be solved
+    /// Returns the index of the opcode that cannot be solved, if any.
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn check_circuit<F: AcirField>(&mut self, circuit: &Circuit<F>) -> bool {
+    pub fn check_circuit<F: AcirField>(&mut self, circuit: &Circuit<F>) -> Option<usize> {
         let circuit_inputs = circuit.circuit_arguments();
         self.solvable_witness.extend(circuit_inputs.iter());
-        for op in &circuit.opcodes {
+        for (i, op) in circuit.opcodes.iter().enumerate() {
             if !self.try_solve(op) {
-                return false;
+                return Some(i);
             }
         }
-        true
+        None
     }
 
     /// Check if the Opcode can be solved, and if yes, add the solved witness to set of solvable witness
@@ -83,24 +80,21 @@ impl CircuitSimulator {
                 }
                 true
             }
-            Opcode::MemoryOp { block_id, op, predicate } => {
+            Opcode::MemoryOp { block_id, op } => {
+                if !self.initialized_blocks.contains(block_id) {
+                    // Memory must be initialized before it can be used.
+                    return false;
+                }
                 if !self.can_solve_expression(&op.index) {
                     return false;
                 }
-                if let Some(predicate) = predicate {
-                    if !self.can_solve_expression(predicate) {
-                        return false;
-                    }
-                }
                 if op.operation.is_zero() {
-                    let w = op.value.to_witness().unwrap();
+                    let Some(w) = op.value.to_witness() else {
+                        return false;
+                    };
                     self.mark_solvable(w);
                     true
                 } else {
-                    if let Some(BlockStatus::Used) = self.resolved_blocks.get(block_id) {
-                        // Writing after having used the block should not be allowed
-                        return false;
-                    }
                     self.try_solve(&Opcode::AssertZero(op.value.clone()))
                 }
             }
@@ -110,8 +104,7 @@ impl CircuitSimulator {
                         return false;
                     }
                 }
-                self.resolved_blocks.insert(*block_id, BlockStatus::Initialized);
-                true
+                self.initialized_blocks.insert(*block_id)
             }
             Opcode::BrilligCall { id: _, inputs, outputs, predicate } => {
                 for input in inputs {
@@ -161,8 +154,8 @@ impl CircuitSimulator {
     }
 
     pub fn can_solve_function_input<F: AcirField>(&self, input: &FunctionInput<F>) -> bool {
-        if !input.is_constant() {
-            return self.solvable_witness.contains(&input.to_witness());
+        if let FunctionInput::Witness(w) = input {
+            return self.solvable_witness.contains(w);
         }
         true
     }
@@ -186,26 +179,15 @@ impl CircuitSimulator {
                 true
             }
 
-            BrilligInputs::MemoryArray(block_id) => match self.resolved_blocks.entry(*block_id) {
-                std::collections::hash_map::Entry::Vacant(_) => false,
-                std::collections::hash_map::Entry::Occupied(entry)
-                    if *entry.get() == BlockStatus::Used =>
-                {
-                    true
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.insert(BlockStatus::Used);
-                    true
-                }
-            },
+            BrilligInputs::MemoryArray(block_id) => self.initialized_blocks.contains(block_id),
         }
     }
 
-    pub(crate) fn expr_wit<F>(expr: &Expression<F>) -> BTreeSet<Witness> {
-        let mut result = BTreeSet::new();
-        result.extend(expr.mul_terms.iter().flat_map(|i| vec![i.1, i.2]));
-        result.extend(expr.linear_combinations.iter().map(|i| i.1));
-        result
+    pub(crate) fn expr_wit<F>(expr: &Expression<F>) -> impl Iterator<Item = Witness> {
+        expr.mul_terms
+            .iter()
+            .flat_map(|i| [i.1, i.2])
+            .chain(expr.linear_combinations.iter().map(|i| i.1))
     }
 }
 
@@ -217,7 +199,11 @@ mod tests {
     use acir::{
         FieldElement,
         acir_field::AcirField,
-        circuit::{Circuit, ExpressionWidth, Opcode, PublicInputs},
+        circuit::{
+            Circuit, Opcode, PublicInputs,
+            brillig::{BrilligFunctionId, BrilligInputs},
+            opcodes::{BlockId, BlockType, MemOp},
+        },
         native_types::{Expression, Witness},
     };
 
@@ -227,8 +213,8 @@ mod tests {
         public_parameters: PublicInputs,
     ) -> Circuit<FieldElement> {
         Circuit {
+            function_name: "test_circuit".to_string(),
             current_witness_index: 1,
-            expression_width: ExpressionWidth::Bounded { width: 4 },
             opcodes,
             private_parameters,
             public_parameters,
@@ -241,7 +227,7 @@ mod tests {
     fn reports_true_for_empty_circuit() {
         let empty_circuit = test_circuit(vec![], BTreeSet::default(), PublicInputs::default());
 
-        assert!(CircuitSimulator::default().check_circuit(&empty_circuit));
+        assert!(CircuitSimulator::default().check_circuit(&empty_circuit).is_none());
     }
 
     #[test]
@@ -259,7 +245,7 @@ mod tests {
             PublicInputs::default(),
         );
 
-        assert!(CircuitSimulator::default().check_circuit(&connected_circuit));
+        assert!(CircuitSimulator::default().check_circuit(&connected_circuit).is_none());
     }
 
     #[test]
@@ -287,6 +273,67 @@ mod tests {
             PublicInputs::default(),
         );
 
-        assert!(!CircuitSimulator::default().check_circuit(&disconnected_circuit));
+        assert!(CircuitSimulator::default().check_circuit(&disconnected_circuit).is_some());
+    }
+
+    #[test]
+    fn reports_true_when_memory_block_passed_to_brillig_and_then_written_to() {
+        let circuit = test_circuit(
+            vec![
+                Opcode::AssertZero(Expression {
+                    mul_terms: Vec::new(),
+                    linear_combinations: vec![(FieldElement::one(), Witness(1))],
+                    q_c: FieldElement::zero(),
+                }),
+                Opcode::MemoryInit {
+                    block_id: BlockId(0),
+                    init: vec![Witness(0)],
+                    block_type: BlockType::Memory,
+                },
+                Opcode::BrilligCall {
+                    id: BrilligFunctionId(0),
+                    inputs: vec![BrilligInputs::MemoryArray(BlockId(0))],
+                    outputs: Vec::new(),
+                    predicate: None,
+                },
+                Opcode::MemoryOp {
+                    block_id: BlockId(0),
+                    op: MemOp::read_at_mem_index(
+                        Expression {
+                            mul_terms: Vec::new(),
+                            linear_combinations: Vec::new(),
+                            q_c: FieldElement::one(),
+                        },
+                        Witness(2),
+                    ),
+                },
+            ],
+            BTreeSet::from([Witness(1)]),
+            PublicInputs::default(),
+        );
+
+        assert!(CircuitSimulator::default().check_circuit(&circuit).is_some());
+    }
+
+    #[test]
+    fn reports_false_when_attempting_to_reinitialize_memory_block() {
+        let circuit = test_circuit(
+            vec![
+                Opcode::MemoryInit {
+                    block_id: BlockId(0),
+                    init: vec![Witness(0)],
+                    block_type: BlockType::Memory,
+                },
+                Opcode::MemoryInit {
+                    block_id: BlockId(0),
+                    init: vec![Witness(0)],
+                    block_type: BlockType::Memory,
+                },
+            ],
+            BTreeSet::from([Witness(0)]),
+            PublicInputs::default(),
+        );
+
+        assert!(CircuitSimulator::default().check_circuit(&circuit).is_some());
     }
 }

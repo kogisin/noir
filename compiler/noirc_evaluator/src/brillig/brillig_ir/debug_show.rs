@@ -32,8 +32,8 @@ impl DebugToString for MemoryAddress {
             "StackPointer".into()
         } else {
             match self {
-                MemoryAddress::Direct(address) => format!("M{}", address),
-                MemoryAddress::Relative(offset) => format!("S{}", offset),
+                MemoryAddress::Direct(address) => format!("M{address}"),
+                MemoryAddress::Relative(offset) => format!("S{offset}"),
             }
         }
     }
@@ -344,65 +344,11 @@ impl DebugShow {
                     result
                 );
             }
-            BlackBoxOp::BigIntAdd { lhs, rhs, output } => {
+            BlackBoxOp::Poseidon2Permutation { message, output } => {
                 debug_println!(
                     self.enable_debug_trace,
-                    "  BIGINT_ADD {} {} -> {}",
-                    lhs,
-                    rhs,
-                    output
-                );
-            }
-            BlackBoxOp::BigIntSub { lhs, rhs, output } => {
-                debug_println!(
-                    self.enable_debug_trace,
-                    "  BIGINT_NEG {} {} -> {}",
-                    lhs,
-                    rhs,
-                    output
-                );
-            }
-            BlackBoxOp::BigIntMul { lhs, rhs, output } => {
-                debug_println!(
-                    self.enable_debug_trace,
-                    "  BIGINT_MUL {} {} -> {}",
-                    lhs,
-                    rhs,
-                    output
-                );
-            }
-            BlackBoxOp::BigIntDiv { lhs, rhs, output } => {
-                debug_println!(
-                    self.enable_debug_trace,
-                    "  BIGINT_DIV {} {} -> {}",
-                    lhs,
-                    rhs,
-                    output
-                );
-            }
-            BlackBoxOp::BigIntFromLeBytes { inputs, modulus, output } => {
-                debug_println!(
-                    self.enable_debug_trace,
-                    "  BIGINT_FROM_LE_BYTES {} {} -> {}",
-                    inputs,
-                    modulus,
-                    output
-                );
-            }
-            BlackBoxOp::BigIntToLeBytes { input, output } => {
-                debug_println!(
-                    self.enable_debug_trace,
-                    "  BIGINT_TO_LE_BYTES {} -> {}",
-                    input,
-                    output
-                );
-            }
-            BlackBoxOp::Poseidon2Permutation { message, output, len } => {
-                debug_println!(
-                    self.enable_debug_trace,
-                    "  POSEIDON2_PERMUTATION {} {} -> {}",
+                    "  POSEIDON2_PERMUTATION {} -> {}",
                     message,
-                    len,
                     output
                 );
             }

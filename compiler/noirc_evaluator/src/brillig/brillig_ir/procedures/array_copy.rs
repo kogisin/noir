@@ -24,9 +24,10 @@ impl<F: AcirField + DebugToString, Registers: RegisterAllocator> BrilligContext<
         source_array: BrilligArray,
         destination_array: BrilligArray,
     ) {
-        let source_array_pointer_arg = MemoryAddress::direct(ScratchSpace::start());
-        let source_array_memory_size_arg = MemoryAddress::direct(ScratchSpace::start() + 1);
-        let new_array_pointer_return = MemoryAddress::direct(ScratchSpace::start() + 2);
+        let scratch_start = ScratchSpace::start();
+        let source_array_pointer_arg = MemoryAddress::direct(scratch_start);
+        let source_array_memory_size_arg = MemoryAddress::direct(scratch_start + 1);
+        let new_array_pointer_return = MemoryAddress::direct(scratch_start + 2);
 
         self.mov_instruction(source_array_pointer_arg, source_array.pointer);
         self.usize_const_instruction(source_array_memory_size_arg, (source_array.size + 1).into());
@@ -40,9 +41,10 @@ impl<F: AcirField + DebugToString, Registers: RegisterAllocator> BrilligContext<
 pub(super) fn compile_array_copy_procedure<F: AcirField + DebugToString>(
     brillig_context: &mut BrilligContext<F, ScratchSpace>,
 ) {
-    let source_array_pointer_arg = MemoryAddress::direct(ScratchSpace::start());
-    let source_array_memory_size_arg = MemoryAddress::direct(ScratchSpace::start() + 1);
-    let new_array_pointer_return = MemoryAddress::direct(ScratchSpace::start() + 2);
+    let scratch_start = brillig_context.registers.start();
+    let source_array_pointer_arg = MemoryAddress::direct(scratch_start);
+    let source_array_memory_size_arg = MemoryAddress::direct(scratch_start + 1);
+    let new_array_pointer_return = MemoryAddress::direct(scratch_start + 2);
 
     brillig_context.set_allocated_registers(vec![
         source_array_pointer_arg,
@@ -81,20 +83,11 @@ pub(super) fn compile_array_copy_procedure<F: AcirField + DebugToString>(
 
             // Increase our array copy counter if that flag is set
             if ctx.count_arrays_copied {
-                let array_copy_counter = BrilligVariable::SingleAddr(SingleAddrVariable {
-                    address: ctx.array_copy_counter_address(),
-                    bit_size: 32,
-                });
-
-                let counter_register = array_copy_counter.extract_register();
-                ctx.codegen_usize_op(counter_register, counter_register, BrilligBinaryOp::Add, 1);
+                ctx.codegen_increment_array_copy_counter();
             }
         }
     });
 }
-
-/// The message to print when copying an array.
-const ARRAY_COPY_COUNTER_MESSAGE: &str = "Total arrays copied: {}";
 
 /// The metadata string needed to tell `print` to print out a u32
 const PRINT_U32_TYPE_STRING: &str = "{\"kind\":\"unsignedinteger\",\"width\":32}";
@@ -159,7 +152,8 @@ impl<F: AcirField + DebugToString, Registers: RegisterAllocator> BrilligContext<
         });
 
         let newline = ValueOrArray::MemoryAddress(ReservedRegisters::usize_one());
-        let message = literal_string_to_value(ARRAY_COPY_COUNTER_MESSAGE, self);
+        let message_with_func_name = format!("Total arrays copied in {}: {{}}", &self.name());
+        let message = literal_string_to_value(&message_with_func_name, self);
         let item_count = ValueOrArray::MemoryAddress(ReservedRegisters::usize_one());
         let value_to_print = ValueOrArray::MemoryAddress(array_copy_counter.extract_register());
         let type_string_metadata = literal_string_to_value(PRINT_U32_TYPE_STRING, self);
@@ -179,7 +173,7 @@ impl<F: AcirField + DebugToString, Registers: RegisterAllocator> BrilligContext<
         let u32_type = HeapValueType::Simple(BitSize::Integer(IntegerBitSize::U32));
 
         let newline_type = u1_type.clone();
-        let size = ARRAY_COPY_COUNTER_MESSAGE.len();
+        let size = message_with_func_name.len();
         let msg_type = HeapValueType::Array { value_types: vec![u8_type.clone()], size };
         let item_count_type = HeapValueType::field();
         let value_to_print_type = u32_type;

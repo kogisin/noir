@@ -1,9 +1,10 @@
 use acvm::acir::brillig::Opcode as BrilligOpcode;
 use acvm::acir::circuit::ErrorSelector;
+use noirc_errors::call_stack::CallStackId;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ErrorType;
-use crate::ssa::ir::{basic_block::BasicBlockId, call_stack::CallStack, function::FunctionId};
+use crate::ssa::ir::{basic_block::BasicBlockId, function::FunctionId};
 
 use super::procedures::ProcedureId;
 
@@ -21,19 +22,30 @@ pub(crate) enum BrilligParameter {
 
 /// The result of compiling and linking brillig artifacts.
 /// This is ready to run bytecode with attached metadata.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct GeneratedBrillig<F> {
     pub(crate) byte_code: Vec<BrilligOpcode<F>>,
-    pub(crate) locations: BTreeMap<OpcodeLocation, CallStack>,
+    pub(crate) locations: BTreeMap<OpcodeLocation, CallStackId>,
     pub(crate) error_types: BTreeMap<ErrorSelector, ErrorType>,
     pub(crate) name: String,
     pub(crate) procedure_locations: BTreeMap<ProcedureId, (OpcodeLocation, OpcodeLocation)>,
 }
 
+impl<F: std::fmt::Display> std::fmt::Display for GeneratedBrillig<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "fn {}", self.name)?;
+        let width = self.byte_code.len().to_string().len();
+        for (index, opcode) in self.byte_code.iter().enumerate() {
+            writeln!(f, "{index:>width$}: {opcode}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 /// Artifacts resulting from the compilation of a function into brillig byte code.
 /// It includes the bytecode of the function and all the metadata that allows linking with other functions.
-pub(crate) struct BrilligArtifact<F> {
+pub struct BrilligArtifact<F> {
     pub(crate) byte_code: Vec<BrilligOpcode<F>>,
     pub(crate) error_types: BTreeMap<ErrorSelector, ErrorType>,
     /// The set of jumps that need to have their locations
@@ -49,9 +61,9 @@ pub(crate) struct BrilligArtifact<F> {
     /// TODO: and have an enum which indicates whether the jump is internal or external
     unresolved_external_call_labels: Vec<(JumpInstructionPosition, Label)>,
     /// Maps the opcodes that are associated with a callstack to it.
-    locations: BTreeMap<OpcodeLocation, CallStack>,
+    locations: BTreeMap<OpcodeLocation, CallStackId>,
     /// The current call stack. All opcodes that are pushed will be associated with this call stack.
-    call_stack: CallStack,
+    call_stack_id: CallStackId,
     /// Name of the function, only used for debugging purposes.
     pub(crate) name: String,
 
@@ -62,6 +74,17 @@ pub(crate) struct BrilligArtifact<F> {
     /// which opcodes originate from reusable procedures.s
     /// The range is inclusive for both start and end opcode locations.
     pub(crate) procedure_locations: BTreeMap<ProcedureId, (OpcodeLocation, OpcodeLocation)>,
+}
+
+impl<F: std::fmt::Display> std::fmt::Display for BrilligArtifact<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "fn {}", self.name)?;
+        let width = self.byte_code.len().to_string().len();
+        for (index, opcode) in self.byte_code.iter().enumerate() {
+            writeln!(f, "{index:>width$}: {opcode}")?;
+        }
+        Ok(())
+    }
 }
 
 /// A pointer to a location in the opcode.
@@ -85,13 +108,13 @@ impl std::fmt::Display for LabelType {
         match self {
             LabelType::Function(function_id, block_id) => {
                 if let Some(block_id) = block_id {
-                    write!(f, "Function({:?}, {:?})", function_id, block_id)
+                    write!(f, "Function({function_id:?}, {block_id:?})")
                 } else {
-                    write!(f, "Function({:?})", function_id)
+                    write!(f, "Function({function_id:?})")
                 }
             }
             LabelType::Entrypoint => write!(f, "Entrypoint"),
-            LabelType::Procedure(procedure_id) => write!(f, "Procedure({:?})", procedure_id),
+            LabelType::Procedure(procedure_id) => write!(f, "Procedure({procedure_id:?})"),
             LabelType::GlobalInit(function_id) => {
                 write!(f, "Globals Initialization({function_id:?})")
             }
@@ -227,14 +250,14 @@ impl<F: Clone + std::fmt::Debug> BrilligArtifact<F> {
         }
 
         for (position_in_bytecode, call_stack) in obj.locations.iter() {
-            self.locations.insert(position_in_bytecode + offset, call_stack.clone());
+            self.locations.insert(position_in_bytecode + offset, *call_stack);
         }
     }
 
     /// Adds a brillig instruction to the brillig byte code
     pub(crate) fn push_opcode(&mut self, opcode: BrilligOpcode<F>) {
-        if !self.call_stack.is_empty() {
-            self.locations.insert(self.index_of_next_opcode(), self.call_stack.clone());
+        if !self.call_stack_id.is_root() {
+            self.locations.insert(self.index_of_next_opcode(), self.call_stack_id);
         }
         self.byte_code.push(opcode);
     }
@@ -267,12 +290,7 @@ impl<F: Clone + std::fmt::Debug> BrilligArtifact<F> {
 
     /// Returns true if the opcode is a jump instruction
     fn is_jmp_instruction(instruction: &BrilligOpcode<F>) -> bool {
-        matches!(
-            instruction,
-            BrilligOpcode::JumpIfNot { .. }
-                | BrilligOpcode::JumpIf { .. }
-                | BrilligOpcode::Jump { .. }
-        )
+        matches!(instruction, BrilligOpcode::JumpIf { .. } | BrilligOpcode::Jump { .. })
     }
 
     /// Adds a label in the bytecode to specify where this block's
@@ -312,15 +330,6 @@ impl<F: Clone + std::fmt::Debug> BrilligArtifact<F> {
                     self.byte_code[*location_of_jump] =
                         BrilligOpcode::Jump { location: resolved_location };
                 }
-                BrilligOpcode::JumpIfNot { condition, location } => {
-                    assert_eq!(
-                        location, 0,
-                        "location is not zero, which means that the jump label does not need resolving"
-                    );
-
-                    self.byte_code[*location_of_jump] =
-                        BrilligOpcode::JumpIfNot { condition, location: resolved_location };
-                }
                 BrilligOpcode::JumpIf { condition, location } => {
                     assert_eq!(
                         location, 0,
@@ -346,8 +355,8 @@ impl<F: Clone + std::fmt::Debug> BrilligArtifact<F> {
         }
     }
 
-    pub(crate) fn set_call_stack(&mut self, call_stack: CallStack) {
-        self.call_stack = call_stack;
+    pub(crate) fn set_call_stack(&mut self, call_stack: CallStackId) {
+        self.call_stack_id = call_stack;
     }
 
     #[cfg(test)]

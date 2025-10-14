@@ -1,4 +1,5 @@
 use crate::{
+    check_errors,
     hir::{
         comptime::ComptimeError,
         def_collector::{
@@ -6,10 +7,9 @@ use crate::{
             errors::{DefCollectorErrorKind, DuplicateType},
         },
     },
-    tests::check_errors,
 };
 
-use super::{assert_no_errors, get_program_errors};
+use crate::{assert_no_errors, get_program_errors};
 
 // Regression for #5388
 #[test]
@@ -18,7 +18,7 @@ fn comptime_let() {
         comptime let my_var = 2;
         assert_eq(my_var, 2);
     }"#;
-    assert_no_errors(src);
+    assert_no_errors!(src);
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn comptime_code_rejects_dynamic_variable() {
         assert_eq(my_var, 2);
     }
     "#;
-    check_errors(src);
+    check_errors!(src);
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn comptime_type_in_runtime_code() {
                    ^^^^^^^^^^^^^^^^^^ Comptime-only type `FunctionDefinition` cannot be used in runtime code
                    ~~~~~~~~~~~~~~~~~~ Comptime-only type used here
     ";
-    check_errors(source);
+    check_errors!(source);
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn macro_result_type_mismatch() {
             q
         }
     "#;
-    check_errors(src);
+    check_errors!(src);
 }
 
 #[test]
@@ -83,11 +83,9 @@ fn unquoted_integer_as_integer_token() {
             }
         }
     }
-
-    fn main() {}
     "#;
 
-    assert_no_errors(src);
+    assert_no_errors!(src);
 }
 
 #[test]
@@ -106,7 +104,7 @@ fn allows_references_to_structs_generated_by_macros() {
     }
     "#;
 
-    assert_no_errors(src);
+    assert_no_errors!(src);
 }
 
 #[test]
@@ -133,7 +131,7 @@ fn errors_if_macros_inject_functions_with_name_collisions() {
     }
     "#;
 
-    let mut errors = get_program_errors(src);
+    let mut errors = get_program_errors!(src);
     assert_eq!(errors.len(), 1);
 
     let CompilationError::ComptimeError(ComptimeError::ErrorRunningAttribute { error, .. }) =
@@ -168,10 +166,8 @@ fn uses_correct_type_for_attribute_arguments() {
         let y: u32 = 1;
         let _ = y == i[0];
     }
-
-    fn main() {}
     "#;
-    assert_no_errors(src);
+    assert_no_errors!(src);
 }
 
 #[test]
@@ -196,5 +192,5 @@ fn does_not_fail_to_parse_macro_on_parser_warning() {
         bar()
     }
     "#;
-    check_errors(src);
+    check_errors!(src);
 }

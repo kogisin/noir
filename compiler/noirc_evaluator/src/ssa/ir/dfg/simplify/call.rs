@@ -1,21 +1,18 @@
+use noirc_errors::call_stack::CallStackId;
+use rustc_hash::FxHashMap as HashMap;
 use std::{collections::VecDeque, sync::Arc};
 
 use acvm::{AcirField as _, FieldElement, acir::BlackBoxFunc};
 use bn254_blackbox_solver::derive_generators;
-use fxhash::FxHashMap as HashMap;
 use iter_extended::vecmap;
 use num_bigint::BigUint;
 
-use crate::ssa::{
-    ir::{
-        basic_block::BasicBlockId,
-        call_stack::CallStackId,
-        dfg::DataFlowGraph,
-        instruction::{Binary, BinaryOp, Endian, Hint, Instruction, Intrinsic},
-        types::{NumericType, Type},
-        value::{Value, ValueId},
-    },
-    opt::flatten_cfg::value_merger::ValueMerger,
+use crate::ssa::ir::{
+    basic_block::BasicBlockId,
+    dfg::{DataFlowGraph, simplify::value_merger::ValueMerger},
+    instruction::{Binary, BinaryOp, Endian, Hint, Instruction, Intrinsic},
+    types::{NumericType, Type},
+    value::{Value, ValueId},
 };
 
 use super::SimplifyResult;
@@ -57,7 +54,7 @@ pub(super) fn simplify_call(
                 } else {
                     unreachable!("ICE: Intrinsic::ToRadix return type must be array")
                 };
-                constant_to_radix(endian, field, 2, limb_count, |values| {
+                simplify_constant_to_radix(endian, field, 2, limb_count, |values| {
                     make_constant_array(
                         dfg,
                         values.into_iter(),
@@ -80,7 +77,7 @@ pub(super) fn simplify_call(
                 } else {
                     unreachable!("ICE: Intrinsic::ToRadix return type must be array")
                 };
-                constant_to_radix(endian, field, radix, limb_count, |values| {
+                simplify_constant_to_radix(endian, field, radix, limb_count, |values| {
                     make_constant_array(
                         dfg,
                         values.into_iter(),
@@ -95,7 +92,7 @@ pub(super) fn simplify_call(
         }
         Intrinsic::ArrayLen => {
             if let Some(length) = dfg.try_get_array_length(arguments[0]) {
-                let length = FieldElement::from(length as u128);
+                let length = FieldElement::from(u128::from(length));
                 SimplifyResult::SimplifiedTo(dfg.make_constant(length, NumericType::length_type()))
             } else if matches!(dfg.type_of_value(arguments[1]), Type::Slice(_)) {
                 SimplifyResult::SimplifiedTo(arguments[0])
@@ -138,7 +135,8 @@ pub(super) fn simplify_call(
                         slice.push_back(*elem);
                     }
 
-                    let new_slice_length = increment_slice_length(arguments[0], dfg, block);
+                    let new_slice_length =
+                        increment_slice_length(arguments[0], dfg, block, call_stack);
 
                     let new_slice = make_array(dfg, slice, element_type, block, call_stack);
                     return SimplifyResult::SimplifiedToMultiple(vec![new_slice_length, new_slice]);
@@ -156,7 +154,7 @@ pub(super) fn simplify_call(
                     slice.push_front(*elem);
                 }
 
-                let new_slice_length = increment_slice_length(arguments[0], dfg, block);
+                let new_slice_length = increment_slice_length(arguments[0], dfg, block, call_stack);
 
                 let new_slice = make_array(dfg, slice, element_type, block, call_stack);
                 SimplifyResult::SimplifiedToMultiple(vec![new_slice_length, new_slice])
@@ -196,7 +194,7 @@ pub(super) fn simplify_call(
                     slice.pop_front().expect("There are no elements in this slice to be removed")
                 });
 
-                let new_slice_length = decrement_slice_length(arguments[0], dfg, block);
+                let new_slice_length = decrement_slice_length(arguments[0], dfg, block, call_stack);
 
                 results.push(new_slice_length);
 
@@ -229,7 +227,7 @@ pub(super) fn simplify_call(
                     index += 1;
                 }
 
-                let new_slice_length = increment_slice_length(arguments[0], dfg, block);
+                let new_slice_length = increment_slice_length(arguments[0], dfg, block, call_stack);
 
                 let new_slice = make_array(dfg, slice, typ, block, call_stack);
                 SimplifyResult::SimplifiedToMultiple(vec![new_slice_length, new_slice])
@@ -267,7 +265,7 @@ pub(super) fn simplify_call(
                 let new_slice = make_array(dfg, slice, typ, block, call_stack);
                 results.insert(0, new_slice);
 
-                let new_slice_length = decrement_slice_length(arguments[0], dfg, block);
+                let new_slice_length = decrement_slice_length(arguments[0], dfg, block, call_stack);
 
                 results.insert(0, new_slice_length);
 
@@ -288,11 +286,12 @@ pub(super) fn simplify_call(
             }
         }
         Intrinsic::StaticAssert => {
-            if arguments.len() != 2 {
+            if arguments.len() < 2 {
                 panic!("ICE: static_assert called with wrong number of arguments")
             }
 
-            if !dfg.is_constant(arguments[1]) {
+            // Arguments at positions `1..` form the message and they must all be constant.
+            if arguments.iter().skip(1).any(|argument| !dfg.is_constant(*argument)) {
                 return SimplifyResult::None;
             }
 
@@ -347,8 +346,15 @@ pub(super) fn simplify_call(
                 SimplifyResult::None
             }
         }
-        Intrinsic::ArrayRefCount => SimplifyResult::None,
-        Intrinsic::SliceRefCount => SimplifyResult::None,
+        Intrinsic::ArrayRefCount | Intrinsic::SliceRefCount => {
+            if dfg.runtime.is_acir() {
+                // In ACIR, ref counts are not tracked so we always simplify them to zero.
+                let zero = dfg.make_constant(FieldElement::zero(), NumericType::unsigned(32));
+                SimplifyResult::SimplifiedTo(zero)
+            } else {
+                SimplifyResult::None
+            }
+        }
     };
 
     if let (Some(expected_types), SimplifyResult::SimplifiedTo(result)) =
@@ -365,20 +371,32 @@ pub(super) fn simplify_call(
 }
 
 /// Returns a slice (represented by a tuple (len, slice)) of constants corresponding to the limbs of the radix decomposition.
-fn constant_to_radix(
+fn simplify_constant_to_radix(
     endian: Endian,
     field: FieldElement,
     radix: u32,
     limb_count: u32,
     mut make_array: impl FnMut(Vec<FieldElement>) -> ValueId,
 ) -> SimplifyResult {
+    match constant_to_radix(endian, field, radix, limb_count) {
+        Some(result) => SimplifyResult::SimplifiedTo(make_array(result)),
+        None => SimplifyResult::None,
+    }
+}
+
+pub(crate) fn constant_to_radix(
+    endian: Endian,
+    field: FieldElement,
+    radix: u32,
+    limb_count: u32,
+) -> Option<Vec<FieldElement>> {
     let bit_size = u32::BITS - (radix - 1).leading_zeros();
     let radix_big = BigUint::from(radix);
     let radix_range = BigUint::from(2u128)..=BigUint::from(256u128);
     if !radix_range.contains(&radix_big) || BigUint::from(2u128).pow(bit_size) != radix_big {
         // NOTE: expect an error to be thrown later in
         // acir::generated_acir::radix_le_decompose
-        return SimplifyResult::None;
+        return None;
     }
     let big_integer = BigUint::from_bytes_be(&field.to_be_bytes());
 
@@ -387,7 +405,7 @@ fn constant_to_radix(
     if limb_count < decomposed_integer.len() as u32 {
         // `field` cannot be represented as `limb_count` bits.
         // defer error to acir_gen.
-        SimplifyResult::None
+        None
     } else {
         let mut limbs = vecmap(0..limb_count, |i| match decomposed_integer.get(i as usize) {
             Some(digit) => FieldElement::from_be_bytes_reduce(&[*digit]),
@@ -396,8 +414,7 @@ fn constant_to_radix(
         if endian == Endian::Big {
             limbs.reverse();
         }
-        let result_array = make_array(limbs);
-        SimplifyResult::SimplifiedTo(result_array)
+        Some(limbs)
     }
 }
 
@@ -438,10 +455,10 @@ fn update_slice_length(
     dfg: &mut DataFlowGraph,
     operator: BinaryOp,
     block: BasicBlockId,
+    call_stack: CallStackId,
 ) -> ValueId {
     let one = dfg.make_constant(FieldElement::one(), NumericType::length_type());
     let instruction = Instruction::Binary(Binary { lhs: slice_len, operator, rhs: one });
-    let call_stack = dfg.get_value_call_stack_id(slice_len);
     dfg.insert_instruction_and_results(instruction, block, None, call_stack).first()
 }
 
@@ -449,16 +466,19 @@ fn increment_slice_length(
     slice_len: ValueId,
     dfg: &mut DataFlowGraph,
     block: BasicBlockId,
+    call_stack: CallStackId,
 ) -> ValueId {
-    update_slice_length(slice_len, dfg, BinaryOp::Add { unchecked: false }, block)
+    update_slice_length(slice_len, dfg, BinaryOp::Add { unchecked: false }, block, call_stack)
 }
 
 fn decrement_slice_length(
     slice_len: ValueId,
     dfg: &mut DataFlowGraph,
     block: BasicBlockId,
+    call_stack: CallStackId,
 ) -> ValueId {
-    update_slice_length(slice_len, dfg, BinaryOp::Sub { unchecked: true }, block)
+    // Simplifications only run if the length is a known non-zero constant, so the subtraction should never overflow.
+    update_slice_length(slice_len, dfg, BinaryOp::Sub { unchecked: true }, block, call_stack)
 }
 
 fn simplify_slice_push_back(
@@ -481,7 +501,7 @@ fn simplify_slice_push_back(
         .insert_instruction_and_results(len_not_equals_capacity_instr, block, None, call_stack)
         .first();
 
-    let new_slice_length = increment_slice_length(arguments[0], dfg, block);
+    let new_slice_length = increment_slice_length(arguments[0], dfg, block, call_stack);
 
     for elem in &arguments[2..] {
         slice.push_back(*elem);
@@ -505,16 +525,19 @@ fn simplify_slice_push_back(
     slice_sizes.insert(set_last_slice_value, slice_size / element_size);
     slice_sizes.insert(new_slice, slice_size / element_size);
 
-    let unknown = &mut HashMap::default();
-    let mut value_merger =
-        ValueMerger::new(dfg, block, &mut slice_sizes, unknown, None, call_stack);
+    let mut value_merger = ValueMerger::new(dfg, block, &slice_sizes, call_stack);
 
-    let new_slice = value_merger.merge_values(
+    let Ok(new_slice) = value_merger.merge_values(
         len_not_equals_capacity,
         len_equals_capacity,
         set_last_slice_value,
         new_slice,
-    );
+    ) else {
+        // If we were to percolate up the error here, it'd get to insert_instruction and eventually
+        // all of ssa. Instead we just choose not to simplify the slice call since this should
+        // be a rare case.
+        return SimplifyResult::None;
+    };
 
     SimplifyResult::SimplifiedToMultiple(vec![new_slice_length, new_slice])
 }
@@ -530,7 +553,7 @@ fn simplify_slice_pop_back(
     let element_count = element_types.len();
     let mut results = VecDeque::with_capacity(element_count + 1);
 
-    let new_slice_length = decrement_slice_length(arguments[0], dfg, block);
+    let new_slice_length = decrement_slice_length(arguments[0], dfg, block, call_stack);
 
     let element_size =
         dfg.make_constant((element_count as u128).into(), NumericType::length_type());
@@ -540,11 +563,11 @@ fn simplify_slice_pop_back(
         Instruction::binary(BinaryOp::Mul { unchecked: true }, arguments[0], element_size);
     let mut flattened_len =
         dfg.insert_instruction_and_results(flattened_len_instr, block, None, call_stack).first();
-    flattened_len = decrement_slice_length(flattened_len, dfg, block);
 
     // We must pop multiple elements in the case of a slice of tuples
     // Iterating through element types in reverse here since we're popping from the end
     for element_type in element_types.iter().rev() {
+        flattened_len = decrement_slice_length(flattened_len, dfg, block, call_stack);
         let get_last_elem_instr =
             Instruction::ArrayGet { array: arguments[1], index: flattened_len };
 
@@ -553,8 +576,6 @@ fn simplify_slice_pop_back(
             .insert_instruction_and_results(get_last_elem_instr, block, element_type, call_stack)
             .first();
         results.push_front(get_last_elem);
-
-        flattened_len = decrement_slice_length(flattened_len, dfg, block);
     }
 
     results.push_front(arguments[1]);
@@ -612,7 +633,7 @@ fn simplify_black_box_func(
                         const_input.try_into().expect("Keccakf1600 input should have length of 25"),
                     )
                     .expect("Rust solvable black box function should not fail");
-                    let state_values = state.iter().map(|x| FieldElement::from(*x as u128));
+                    let state_values = state.iter().map(|x| FieldElement::from(u128::from(*x)));
                     let result_array = make_constant_array(
                         dfg,
                         state_values,
@@ -649,13 +670,7 @@ fn simplify_black_box_func(
             blackbox::simplify_ec_add(dfg, solver, arguments, block, call_stack)
         }
 
-        BlackBoxFunc::BigIntAdd
-        | BlackBoxFunc::BigIntSub
-        | BlackBoxFunc::BigIntMul
-        | BlackBoxFunc::BigIntDiv
-        | BlackBoxFunc::RecursiveAggregation
-        | BlackBoxFunc::BigIntFromLeBytes
-        | BlackBoxFunc::BigIntToLeBytes => SimplifyResult::None,
+        BlackBoxFunc::RecursiveAggregation => SimplifyResult::None,
 
         BlackBoxFunc::AND => {
             unreachable!("ICE: `BlackBoxFunc::AND` calls should be transformed into a `BinaryOp`")
@@ -691,6 +706,14 @@ fn array_is_constant(dfg: &DataFlowGraph, values: &im::Vector<ValueId>) -> bool 
     values.iter().all(|value| dfg.get_numeric_constant(*value).is_some())
 }
 
+/// Replaces a call to `derive_pedersen_generators` with the results of the computation.
+///
+/// It only works if the arguments to the call are both constants, which means that the
+/// function which contains this call needs to be inlined into its caller, where the
+/// arguments are known. This is taken care of by the `#[no_predicates]` attribute,
+/// which forces inlining after flattening.
+///
+/// This intrinsic must not reach Brillig-gen.
 fn simplify_derive_generators(
     dfg: &mut DataFlowGraph,
     arguments: &[ValueId],
@@ -740,7 +763,7 @@ fn simplify_derive_generators(
 
 #[cfg(test)]
 mod tests {
-    use crate::ssa::{Ssa, opt::assert_normalized_ssa_equals};
+    use crate::{assert_ssa_snapshot, ssa::Ssa};
 
     #[test]
     fn simplify_derive_generators_has_correct_type() {
@@ -757,14 +780,91 @@ mod tests {
             "#;
         let ssa = Ssa::from_str_simplifying(src).unwrap();
 
-        let expected = r#"
-            brillig(inline) fn main func {
-              block():
-                separator = make_array b"DEFAULT_DOMAIN_SEPARATOR"
-                result = make_array [Field 3728882899078719075161482178784387565366481897740339799480980287259621149274, Field -9903063709032878667290627648209915537972247634463802596148419711785767431332, u1 0] : [(Field, Field, u1); 1]
-                return result
-            }
-            "#;
-        assert_normalized_ssa_equals(ssa, expected);
+        assert_ssa_snapshot!(ssa, @r#"
+        brillig(inline) fn main f0 {
+          b0():
+            v15 = make_array b"DEFAULT_DOMAIN_SEPARATOR"
+            v19 = make_array [Field 3728882899078719075161482178784387565366481897740339799480980287259621149274, Field -9903063709032878667290627648209915537972247634463802596148419711785767431332, u1 0] : [(Field, Field, u1); 1]
+            return v19
+        }
+        "#);
+    }
+
+    #[test]
+    fn simplifies_array_refcount_in_acir_to_zero() {
+        let src = r#"
+        acir(inline) fn main func {
+          b0(v0: [Field; 3]):
+            v1 = call array_refcount(v0) -> u32
+            return v1
+        }
+        "#;
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: [Field; 3]):
+            return u32 0
+        }
+        ");
+    }
+
+    #[test]
+    fn does_not_simplify_array_refcount_in_brillig() {
+        let src = r#"
+        brillig(inline) fn main func {
+          b0(v0: [Field; 3]):
+            v1 = call array_refcount(v0) -> u32
+            return v1
+        }
+        "#;
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn main f0 {
+          b0(v0: [Field; 3]):
+            v2 = call array_refcount(v0) -> u32
+            return v2
+        }
+        ");
+    }
+
+    #[test]
+    fn simplifies_slice_refcount_in_acir_to_zero() {
+        let src = r#"
+        acir(inline) fn main func {
+          b0(v0: [Field]):
+            v1 = call slice_refcount(u32 3, v0) -> u32
+            return v1
+        }
+        "#;
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: [Field]):
+            return u32 0
+        }
+        ");
+    }
+
+    #[test]
+    fn does_not_simplify_slice_refcount_in_brillig() {
+        let src = r#"
+        brillig(inline) fn main func {
+          b0(v0: [Field]):
+            v1 = call slice_refcount(u32 3, v0) -> u32
+            return v1
+        }
+        "#;
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn main f0 {
+          b0(v0: [Field]):
+            v3 = call slice_refcount(u32 3, v0) -> u32
+            return v3
+        }
+        ");
     }
 }

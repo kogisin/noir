@@ -1,5 +1,3 @@
-#![warn(unreachable_pub)]
-#![warn(clippy::semicolon_if_nothing_returned)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies, unused_extern_crates))]
 
 use acvm_blackbox_solver::{BlackBoxFunctionSolver, BlackBoxResolutionError};
@@ -56,8 +54,7 @@ impl BlackBoxFunctionSolver<FieldElement> for Bn254BlackBoxSolver {
     fn poseidon2_permutation(
         &self,
         inputs: &[FieldElement],
-        len: u32,
     ) -> Result<Vec<FieldElement>, BlackBoxResolutionError> {
-        poseidon2_permutation(inputs, len)
+        poseidon2_permutation(inputs)
     }
 }

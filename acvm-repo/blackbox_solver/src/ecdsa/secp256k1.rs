@@ -5,14 +5,14 @@ use blake2::digest::generic_array::GenericArray;
 use k256::{
     AffinePoint, EncodedPoint, ProjectivePoint, PublicKey,
     elliptic_curve::{
-        IsHigh,
+        scalar::IsHigh,
         sec1::{Coordinates, ToEncodedPoint},
     },
 };
 use k256::{Scalar, ecdsa::Signature};
 
 pub(super) fn verify_signature(
-    hashed_msg: &[u8],
+    hashed_msg: &[u8; 32],
     public_key_x_bytes: &[u8; 32],
     public_key_y_bytes: &[u8; 32],
     signature: &[u8; 64],
@@ -20,13 +20,14 @@ pub(super) fn verify_signature(
     // Convert the inputs into k256 data structures
     let Ok(signature) = Signature::try_from(signature.as_slice()) else {
         // Signature `r` and `s` are forbidden from being zero.
+        log::warn!("Signature provided for ECDSA verification is zero");
         return false;
     };
 
     let point = EncodedPoint::from_affine_coordinates(
         public_key_x_bytes.into(),
         public_key_y_bytes.into(),
-        true,
+        false,
     );
 
     let pubkey = PublicKey::from_encoded_point(&point);
@@ -34,6 +35,7 @@ pub(super) fn verify_signature(
         pubkey.unwrap()
     } else {
         // Public key must sit on the Secp256k1 curve.
+        log::warn!("Invalid public key provided for ECDSA verification");
         return false;
     };
 
@@ -48,6 +50,9 @@ pub(super) fn verify_signature(
 
     // Ensure signature is "low S" normalized ala BIP 0062
     if s.is_high().into() {
+        log::warn!(
+            "Signature provided for ECDSA verification is not properly normalized (high S value)"
+        );
         return false;
     }
 
@@ -105,6 +110,15 @@ mod secp256k1_tests {
     }
 
     #[test]
+    fn rejects_signature_that_does_not_have_the_full_y_coordinate() {
+        let mut pub_key_y_bytes = [0u8; 32];
+        pub_key_y_bytes[31] = PUB_KEY_Y[31];
+        let valid = verify_signature(&HASHED_MESSAGE, &PUB_KEY_X, &pub_key_y_bytes, &SIGNATURE);
+
+        assert!(!valid);
+    }
+
+    #[test]
     fn rejects_invalid_signature() {
         // This signature is invalid as ECDSA specifies that `r` and `s` must be non-zero.
         let invalid_signature: [u8; 64] = [0x00; 64];
@@ -122,16 +136,5 @@ mod secp256k1_tests {
             verify_signature(&HASHED_MESSAGE, &invalid_pub_key_x, &invalid_pub_key_y, &SIGNATURE);
 
         assert!(!valid);
-    }
-
-    #[test]
-    #[ignore = "ECDSA verification does not currently handle long hashes correctly"]
-    fn trims_overly_long_hashes_to_correct_length() {
-        let mut long_hashed_message = HASHED_MESSAGE.to_vec();
-        long_hashed_message.push(0xff);
-
-        let valid = verify_signature(&long_hashed_message, &PUB_KEY_X, &PUB_KEY_Y, &SIGNATURE);
-
-        assert!(valid);
     }
 }

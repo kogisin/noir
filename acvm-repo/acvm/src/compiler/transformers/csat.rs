@@ -16,8 +16,9 @@ pub const MIN_EXPRESSION_WIDTH: usize = 3;
 ///
 /// This is done by creating intermediate variables to hold partial calculations and then combining them
 /// to calculate the original expression.
-// Should we give it all of the opcodes?
-// Have a single transformer that you instantiate with a width, then pass many opcodes through
+///
+/// Pre-Condition:
+/// - General Optimizer must run before this pass
 pub(crate) struct CSatTransformer {
     width: usize,
     /// Track the witness that can be solved
@@ -66,9 +67,11 @@ impl CSatTransformer {
         self.solvable_witness.insert(witness);
     }
 
-    // Still missing dead witness optimization.
-    // To do this, we will need the whole set of assert-zero opcodes
-    // I think it can also be done before the local optimization seen here, as dead variables will come from the user
+    /// Transform the input arithmetic expression into a new one having the correct 'width'
+    /// by creating intermediate variables as needed.
+    /// Having the correct width means:
+    /// - it has at most one multiplicative term
+    /// - it uses at most 'width-1' witness linear combination terms, to account for the new intermediate variable
     pub(crate) fn transform<F: AcirField>(
         &mut self,
         opcode: Expression<F>,

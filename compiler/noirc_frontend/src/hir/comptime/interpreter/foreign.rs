@@ -1,10 +1,10 @@
 use acvm::{
-    AcirField, BlackBoxResolutionError, FieldElement,
-    acir::BlackBoxFunc,
-    blackbox_solver::{BigIntSolverWithId, BlackBoxFunctionSolver},
+    AcirField, BlackBoxResolutionError, FieldElement, acir::BlackBoxFunc,
+    blackbox_solver::BlackBoxFunctionSolver,
 };
 use bn254_blackbox_solver::Bn254BlackBoxSolver; // Currently locked to only bn254!
 use im::{Vector, vector};
+use iter_extended::vecmap;
 use noirc_errors::Location;
 
 use crate::{
@@ -14,13 +14,14 @@ use crate::{
         interpreter::builtin::builtin_helpers::to_byte_array,
     },
     node_interner::NodeInterner,
+    signed_field::SignedField,
 };
 
 use super::{
     Interpreter,
     builtin::builtin_helpers::{
         check_arguments, check_one_argument, check_three_arguments, check_two_arguments,
-        get_array_map, get_bool, get_field, get_fixed_array_map, get_slice_map, get_struct_field,
+        get_array_map, get_bool, get_field, get_fixed_array_map, get_struct_field,
         get_struct_fields, get_u8, get_u32, get_u64, to_byte_slice, to_struct,
     },
 };
@@ -35,7 +36,6 @@ impl Interpreter<'_, '_> {
     ) -> IResult<Value> {
         call_foreign(
             self.elaborator.interner,
-            &mut self.bigint_solver,
             name,
             arguments,
             return_type,
@@ -48,33 +48,24 @@ impl Interpreter<'_, '_> {
 // Similar to `evaluate_black_box` in `brillig_vm`.
 fn call_foreign(
     interner: &mut NodeInterner,
-    bigint_solver: &mut BigIntSolverWithId,
     name: &str,
     args: Vec<(Value, Location)>,
     return_type: Type,
     location: Location,
     pedantic_solving: bool,
 ) -> IResult<Value> {
-    use BlackBoxFunc::*;
-
     match name {
         "aes128_encrypt" => aes128_encrypt(interner, args, location),
-        "bigint_from_le_bytes" => {
-            bigint_from_le_bytes(interner, bigint_solver, args, return_type, location)
-        }
-        "bigint_to_le_bytes" => bigint_to_le_bytes(bigint_solver, args, location),
-        "bigint_add" => bigint_op(bigint_solver, BigIntAdd, args, return_type, location),
-        "bigint_sub" => bigint_op(bigint_solver, BigIntSub, args, return_type, location),
-        "bigint_mul" => bigint_op(bigint_solver, BigIntMul, args, return_type, location),
-        "bigint_div" => bigint_op(bigint_solver, BigIntDiv, args, return_type, location),
         "blake2s" => blake_hash(interner, args, location, acvm::blackbox_solver::blake2s),
         "blake3" => blake_hash(interner, args, location, acvm::blackbox_solver::blake3),
+        // cSpell:disable-next-line
         "ecdsa_secp256k1" => ecdsa_secp256_verify(
             interner,
             args,
             location,
             acvm::blackbox_solver::ecdsa_secp256k1_verify,
         ),
+        // cSpell:disable-next-line
         "ecdsa_secp256r1" => ecdsa_secp256_verify(
             interner,
             args,
@@ -129,9 +120,11 @@ fn apply_range_constraint(arguments: Vec<(Value, Location)>, location: Location)
     let (value, num_bits) = check_two_arguments(arguments, location)?;
 
     let input = get_field(value)?;
+    let field = input.to_field_element();
+
     let num_bits = get_u32(num_bits)?;
 
-    if input.num_bits() < num_bits {
+    if field.num_bits() < num_bits {
         Ok(Value::Unit)
     } else {
         Err(InterpreterError::BlackBoxError(
@@ -142,71 +135,6 @@ fn apply_range_constraint(arguments: Vec<(Value, Location)>, location: Location)
             location,
         ))
     }
-}
-
-/// `fn from_le_bytes(bytes: [u8], modulus: [u8]) -> BigInt`
-///
-/// Returns the ID of the new bigint allocated by the solver.
-fn bigint_from_le_bytes(
-    interner: &mut NodeInterner,
-    solver: &mut BigIntSolverWithId,
-    arguments: Vec<(Value, Location)>,
-    return_type: Type,
-    location: Location,
-) -> IResult<Value> {
-    let (bytes, modulus) = check_two_arguments(arguments, location)?;
-
-    let (bytes, _) = get_slice_map(interner, bytes, get_u8)?;
-    let (modulus, _) = get_slice_map(interner, modulus, get_u8)?;
-
-    let id = solver
-        .bigint_from_bytes(&bytes, &modulus)
-        .map_err(|e| InterpreterError::BlackBoxError(e, location))?;
-
-    Ok(to_bigint(id, return_type))
-}
-
-/// `fn to_le_bytes(self) -> [u8; 32]`
-///
-/// Take the ID of a bigint and returned its content.
-fn bigint_to_le_bytes(
-    solver: &mut BigIntSolverWithId,
-    arguments: Vec<(Value, Location)>,
-    location: Location,
-) -> IResult<Value> {
-    let int = check_one_argument(arguments, location)?;
-    let id = get_bigint_id(int)?;
-
-    let mut bytes =
-        solver.bigint_to_bytes(id).map_err(|e| InterpreterError::BlackBoxError(e, location))?;
-
-    assert!(bytes.len() <= 32);
-    bytes.resize(32, 0);
-
-    Ok(to_byte_array(&bytes))
-}
-
-/// `fn bigint_add(self, other: BigInt) -> BigInt`
-///
-/// Takes two previous allocated IDs, gets the values from the solver,
-/// stores the result of the operation, returns the new ID.
-fn bigint_op(
-    solver: &mut BigIntSolverWithId,
-    func: BlackBoxFunc,
-    arguments: Vec<(Value, Location)>,
-    return_type: Type,
-    location: Location,
-) -> IResult<Value> {
-    let (lhs, rhs) = check_two_arguments(arguments, location)?;
-
-    let lhs = get_bigint_id(lhs)?;
-    let rhs = get_bigint_id(rhs)?;
-
-    let id = solver
-        .bigint_op(lhs, rhs, func)
-        .map_err(|e| InterpreterError::BlackBoxError(e, location))?;
-
-    Ok(to_bigint(id, return_type))
 }
 
 /// Run one of the Blake hash functions.
@@ -228,6 +156,7 @@ fn blake_hash(
     Ok(to_byte_array(&output))
 }
 
+// cSpell:disable-next-line
 /// Run one of the Secp256 signature verifications.
 /// ```text
 /// pub fn verify_signature<let N: u32>(
@@ -236,32 +165,20 @@ fn blake_hash(
 ///   signature: [u8; 64],
 ///   message_hash: [u8; N],
 /// ) -> bool
-///
-/// pub fn verify_signature_slice(
-///   public_key_x: [u8; 32],
-///   public_key_y: [u8; 32],
-///   signature: [u8; 64],
-///   message_hash: [u8],
-/// ) -> bool
-/// ```
+// cSpell:disable-next-line
 fn ecdsa_secp256_verify(
     interner: &mut NodeInterner,
     arguments: Vec<(Value, Location)>,
     location: Location,
-    f: impl Fn(&[u8], &[u8; 32], &[u8; 32], &[u8; 64]) -> Result<bool, BlackBoxResolutionError>,
+    f: impl Fn(&[u8; 32], &[u8; 32], &[u8; 32], &[u8; 64]) -> Result<bool, BlackBoxResolutionError>,
 ) -> IResult<Value> {
-    let [pub_key_x, pub_key_y, sig, msg_hash] = check_arguments(arguments, location)?;
+    let [pub_key_x, pub_key_y, sig, msg_hash, predicate] = check_arguments(arguments, location)?;
+    assert_eq!(predicate.0, Value::Bool(true), "verify_signature predicate should be true");
 
     let (pub_key_x, _) = get_fixed_array_map(interner, pub_key_x, get_u8)?;
     let (pub_key_y, _) = get_fixed_array_map(interner, pub_key_y, get_u8)?;
     let (sig, _) = get_fixed_array_map(interner, sig, get_u8)?;
-
-    // Hash can be an array or slice.
-    let (msg_hash, _) = if matches!(msg_hash.0.get_type().as_ref(), Type::Array(_, _)) {
-        get_array_map(interner, msg_hash.clone(), get_u8)?
-    } else {
-        get_slice_map(interner, msg_hash, get_u8)?
-    };
+    let (msg_hash, _) = get_fixed_array_map(interner, msg_hash.clone(), get_u8)?;
 
     let is_valid = f(&msg_hash, &pub_key_x, &pub_key_y, &sig)
         .map_err(|e| InterpreterError::BlackBoxError(e, location))?;
@@ -281,7 +198,8 @@ fn embedded_curve_add(
     location: Location,
     pedantic_solving: bool,
 ) -> IResult<Value> {
-    let (point1, point2) = check_two_arguments(arguments, location)?;
+    let (point1, point2, predicate) = check_three_arguments(arguments, location)?;
+    assert_eq!(predicate.0, Value::Bool(true), "ec_add predicate should be true");
 
     let embedded_curve_point_typ = point1.0.get_type().into_owned();
 
@@ -311,7 +229,8 @@ fn multi_scalar_mul(
     location: Location,
     pedantic_solving: bool,
 ) -> IResult<Value> {
-    let (points, scalars) = check_two_arguments(arguments, location)?;
+    let (points, scalars, predicate) = check_three_arguments(arguments, location)?;
+    assert_eq!(predicate.0, Value::Bool(true), "verify_signature predicate should be true");
 
     let (points, _) = get_array_map(interner, points, get_embedded_curve_point)?;
     let (scalars, _) = get_array_map(interner, scalars, get_embedded_curve_scalar)?;
@@ -355,16 +274,16 @@ fn poseidon2_permutation(
     location: Location,
     pedantic_solving: bool,
 ) -> IResult<Value> {
-    let (input, state_length) = check_two_arguments(arguments, location)?;
+    let input = check_one_argument(arguments, location)?;
 
     let (input, typ) = get_array_map(interner, input, get_field)?;
-    let state_length = get_u32(state_length)?;
+    let input = vecmap(input, SignedField::to_field_element);
 
     let fields = Bn254BlackBoxSolver(pedantic_solving)
-        .poseidon2_permutation(&input, state_length)
+        .poseidon2_permutation(&input)
         .map_err(|error| InterpreterError::BlackBoxError(error, location))?;
 
-    let array = fields.into_iter().map(Value::Field).collect();
+    let array = fields.into_iter().map(|f| Value::Field(SignedField::positive(f))).collect();
     Ok(Value::Array(array, typ))
 }
 
@@ -402,17 +321,6 @@ fn sha256_compression(
     Ok(Value::Array(state, typ))
 }
 
-/// Decode a `BigInt` struct.
-///
-/// Returns the ID of the value in the solver.
-fn get_bigint_id((value, location): (Value, Location)) -> IResult<u32> {
-    let (fields, typ) = get_struct_fields("BigInt", (value, location))?;
-    let p = get_struct_field("pointer", &fields, &typ, location, get_u32)?;
-    let m = get_struct_field("modulus", &fields, &typ, location, get_u32)?;
-    assert_eq!(p, m, "`pointer` and `modulus` are expected to be the same");
-    Ok(p)
-}
-
 /// Decode an `EmbeddedCurvePoint` struct.
 ///
 /// Returns `(x, y, is_infinite)`.
@@ -423,7 +331,7 @@ fn get_embedded_curve_point(
     let x = get_struct_field("x", &fields, &typ, location, get_field)?;
     let y = get_struct_field("y", &fields, &typ, location, get_field)?;
     let is_infinite = get_struct_field("is_infinite", &fields, &typ, location, get_bool)?;
-    Ok((x, y, is_infinite))
+    Ok((x.to_field_element(), y.to_field_element(), is_infinite))
 }
 
 /// Decode an `EmbeddedCurveScalar` struct.
@@ -435,11 +343,7 @@ fn get_embedded_curve_scalar(
     let (fields, typ) = get_struct_fields("EmbeddedCurveScalar", (value, location))?;
     let lo = get_struct_field("lo", &fields, &typ, location, get_field)?;
     let hi = get_struct_field("hi", &fields, &typ, location, get_field)?;
-    Ok((lo, hi))
-}
-
-fn to_bigint(id: u32, typ: Type) -> Value {
-    to_struct([("pointer", Value::U32(id)), ("modulus", Value::U32(id))], typ)
+    Ok((lo.to_field_element(), hi.to_field_element()))
 }
 
 fn to_embedded_curve_point(
@@ -449,7 +353,11 @@ fn to_embedded_curve_point(
     typ: Type,
 ) -> Value {
     to_struct(
-        [("x", Value::Field(x)), ("y", Value::Field(y)), ("is_infinite", Value::Bool(is_infinite))],
+        [
+            ("x", Value::Field(SignedField::positive(x))),
+            ("y", Value::Field(SignedField::positive(y))),
+            ("is_infinite", Value::Bool(is_infinite)),
+        ],
         typ,
     )
 }
@@ -486,7 +394,6 @@ mod tests {
                 let pedantic_solving = true;
                 match call_foreign(
                     interpreter.elaborator.interner,
-                    &mut interpreter.bigint_solver,
                     name,
                     Vec::new(),
                     Type::Unit,

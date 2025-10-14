@@ -1,8 +1,37 @@
+/// This module applies backend specific transformation to a [`Circuit`].
+///
+/// ## CSAT: transforms AssertZero opcodes into  AssertZero opcodes having the required width.
+///
+/// For instance, if the width is 4, the AssertZero opcode x1 + x2 + x3 + x4 + x5 - y = 0 will be transformed using 2 intermediate variables (z1,z2):
+/// x1 + x2 + x3 = z1
+/// x4 + x5 = z2
+/// z1 + z2 - y = 0
+/// If x1,..x5 are inputs to the program, they are taggeg as 'solvable', and would be used to compute the value of y.
+/// If we generate the intermediate variable x4 + x5 - y = z3, we get an unsolvable circuit because this AssertZero opcode will have two unkwnon values: y and z3
+/// So the CSAT transformation keep track of which witness would be solved for each opcode in order to only generate solvable intermediat variables.
+///
+/// ## eliminate intermediate variables
+/// The 'eliminate intermediate variables' pass will remove any intermediate variables (for instance created by the previous transformation)
+/// that are used in exactly two AssertZero opcodes.
+/// This results in arithmetic opcodes having linear combinations of potentially large width.
+/// For instance if the intermediate variable is z1 is only used in y:
+/// z1 = x1 + x2 +x3
+/// y = z1 + x4
+/// We remove it, undoing the work done during the CSAT transformation: y = x1 + x2 + x3 + x4
+///
+/// We do this because the backend is expected to handle linear combinations of 'unbounded width' in a more efficient way
+/// than the 'CSAT transformation'.
+/// However, it is worth to compute intermediate variables if they are used in more than one other opcode.
+///
+/// ## redundant_range
+/// The 'range optimization' pass, from the optimizers module will remove any redundant range opcodes again.
+use std::collections::BTreeMap;
+
 use acir::{
     AcirField,
     circuit::{
-        self, Circuit, ExpressionWidth, Opcode,
-        brillig::{BrilligInputs, BrilligOutputs},
+        Circuit, ExpressionWidth, Opcode,
+        brillig::{BrilligFunctionId, BrilligInputs, BrilligOutputs},
         opcodes::{BlackBoxFuncCall, FunctionInput, MemOp},
     },
     native_types::{Expression, Witness},
@@ -13,6 +42,7 @@ mod csat;
 
 pub(crate) use csat::CSatTransformer;
 pub use csat::MIN_EXPRESSION_WIDTH;
+use std::hash::BuildHasher;
 use tracing::info;
 
 use super::{
@@ -29,13 +59,14 @@ const MAX_TRANSFORMER_PASSES: usize = 3;
 pub fn transform<F: AcirField>(
     acir: Circuit<F>,
     expression_width: ExpressionWidth,
+    brillig_side_effects: &BTreeMap<BrilligFunctionId, bool>,
 ) -> (Circuit<F>, AcirTransformationMap) {
     // Track original acir opcode positions throughout the transformation passes of the compilation
     // by applying the modifications done to the circuit opcodes and also to the opcode_positions (delete and insert)
     let acir_opcode_positions = acir.opcodes.iter().enumerate().map(|(i, _)| i).collect();
 
     let (mut acir, acir_opcode_positions) =
-        transform_internal(acir, expression_width, acir_opcode_positions);
+        transform_internal(acir, expression_width, acir_opcode_positions, brillig_side_effects);
 
     let transformation_map = AcirTransformationMap::new(&acir_opcode_positions);
 
@@ -54,6 +85,7 @@ pub(super) fn transform_internal<F: AcirField>(
     mut acir: Circuit<F>,
     expression_width: ExpressionWidth,
     mut acir_opcode_positions: Vec<usize>,
+    brillig_side_effects: &BTreeMap<BrilligFunctionId, bool>,
 ) -> (Circuit<F>, Vec<usize>) {
     if acir.opcodes.len() == 1 && matches!(acir.opcodes[0], Opcode::BrilligCall { .. }) {
         info!("Program is fully unconstrained, skipping transformation pass");
@@ -61,19 +93,23 @@ pub(super) fn transform_internal<F: AcirField>(
     }
 
     // Allow multiple passes until we have stable output.
-    let mut prev_opcodes_hash = fxhash::hash64(&acir.opcodes);
+    let mut prev_opcodes_hash = rustc_hash::FxBuildHasher.hash_one(&acir.opcodes);
 
     // For most test programs it would be enough to loop here, but some of them
     // don't stabilize unless we also repeat the backend agnostic optimizations.
     for _ in 0..MAX_TRANSFORMER_PASSES {
         info!("Number of opcodes {}", acir.opcodes.len());
-        let (new_acir, new_acir_opcode_positions) =
-            transform_internal_once(acir, expression_width, acir_opcode_positions);
+        let (new_acir, new_acir_opcode_positions) = transform_internal_once(
+            acir,
+            expression_width,
+            acir_opcode_positions,
+            brillig_side_effects,
+        );
 
         acir = new_acir;
         acir_opcode_positions = new_acir_opcode_positions;
 
-        let new_opcodes_hash = fxhash::hash64(&acir.opcodes);
+        let new_opcodes_hash = rustc_hash::FxBuildHasher.hash_one(&acir.opcodes);
 
         if new_opcodes_hash == prev_opcodes_hash {
             break;
@@ -87,11 +123,12 @@ pub(super) fn transform_internal<F: AcirField>(
     (acir, acir_opcode_positions)
 }
 
-/// Applies backend specific optimizations to a [`Circuit`].
-///
 /// Accepts an injected `acir_opcode_positions` to allow transformations to be applied directly after optimizations.
 ///
-/// Does a single optimization pass.
+/// If the width is unbounded, it does nothing.
+/// If it is bounded, it first performs the 'CSAT transformation' in one pass, by creating intermediate variables when necessary.
+/// Then it performs `eliminate_intermediate_variable()` which (re-)combine intermediate variables used only once.
+/// It concludes with a round of `replace_redundant_ranges()` which removes range checks made redundant by the previous pass.
 #[tracing::instrument(
     level = "trace",
     name = "transform_acir_once",
@@ -101,7 +138,9 @@ fn transform_internal_once<F: AcirField>(
     mut acir: Circuit<F>,
     expression_width: ExpressionWidth,
     acir_opcode_positions: Vec<usize>,
+    brillig_side_effects: &BTreeMap<BrilligFunctionId, bool>,
 ) -> (Circuit<F>, Vec<usize>) {
+    // If the expression width is unbounded, we don't need to do anything.
     let mut transformer = match &expression_width {
         ExpressionWidth::Unbounded => {
             return (acir, acir_opcode_positions);
@@ -115,9 +154,10 @@ fn transform_internal_once<F: AcirField>(
         }
     };
 
-    // TODO: the code below is only for CSAT transformer
-    // TODO it may be possible to refactor it in a way that we do not need to return early from the r1cs
-    // TODO or at the very least, we could put all of it inside of CSatOptimizer pass
+    // 1. CSAT transformation
+    // Process each opcode in the circuit by marking the solvable witnesses and transforming the AssertZero opcodes
+    // to the required width by creating intermediate variables.
+    // Knowing if a witness is solvable avoids creating un-solvable intermediate variables.
 
     let mut new_acir_opcode_positions: Vec<usize> = Vec::with_capacity(acir_opcode_positions.len());
     // Optimize the assert-zero gates by reducing them into the correct width and
@@ -210,12 +250,12 @@ fn transform_internal_once<F: AcirField>(
 
     acir = Circuit {
         current_witness_index,
-        expression_width,
         opcodes: transformed_opcodes,
         // The transformer does not add new public inputs
         ..acir
     };
 
+    // 2. Eliminate intermediate variables, when they are used in exactly two arithmetic opcodes.
     let mut merge_optimizer = MergeExpressionsOptimizer::new();
 
     let (opcodes, new_acir_opcode_positions) =
@@ -228,9 +268,10 @@ fn transform_internal_once<F: AcirField>(
         ..acir
     };
 
+    // 3. Remove redundant range constraints.
     // The `MergeOptimizer` can merge two witnesses which have range opcodes applied to them
     // so we run the `RangeOptimizer` afterwards to clear these up.
-    let range_optimizer = RangeOptimizer::new(acir);
+    let range_optimizer = RangeOptimizer::new(acir, brillig_side_effects);
     let (acir, new_acir_opcode_positions) =
         range_optimizer.replace_redundant_ranges(new_acir_opcode_positions);
 
@@ -295,14 +336,11 @@ where
                 self.fold_expr(expr);
             }
             Opcode::BlackBoxFuncCall(call) => self.fold_blackbox(call),
-            Opcode::MemoryOp { block_id: _, op, predicate } => {
+            Opcode::MemoryOp { block_id: _, op } => {
                 let MemOp { operation, index, value } = op;
                 self.fold_expr(operation);
                 self.fold_expr(index);
                 self.fold_expr(value);
-                if let Some(pred) = predicate {
-                    self.fold_expr(pred);
-                }
             }
             Opcode::MemoryInit { block_id: _, init, block_type: _ } => {
                 for w in init {
@@ -368,30 +406,30 @@ where
     fn fold_blackbox<F: AcirField>(&mut self, call: &BlackBoxFuncCall<F>) {
         match call {
             BlackBoxFuncCall::AES128Encrypt { inputs, iv, key, outputs } => {
-                self.fold_function_inputs(inputs.as_slice());
-                self.fold_function_inputs(iv.as_slice());
-                self.fold_function_inputs(key.as_slice());
+                self.fold_inputs(inputs.as_slice());
+                self.fold_inputs(iv.as_slice());
+                self.fold_inputs(key.as_slice());
                 self.fold_many(outputs.iter());
             }
-            BlackBoxFuncCall::AND { lhs, rhs, output } => {
-                self.fold_function_input(lhs);
-                self.fold_function_input(rhs);
+            BlackBoxFuncCall::AND { lhs, rhs, output, .. } => {
+                self.fold_input(lhs);
+                self.fold_input(rhs);
                 self.fold(*output);
             }
-            BlackBoxFuncCall::XOR { lhs, rhs, output } => {
-                self.fold_function_input(lhs);
-                self.fold_function_input(rhs);
+            BlackBoxFuncCall::XOR { lhs, rhs, output, .. } => {
+                self.fold_input(lhs);
+                self.fold_input(rhs);
                 self.fold(*output);
             }
-            BlackBoxFuncCall::RANGE { input } => {
-                self.fold_function_input(input);
+            BlackBoxFuncCall::RANGE { input, .. } => {
+                self.fold_input(input);
             }
             BlackBoxFuncCall::Blake2s { inputs, outputs } => {
-                self.fold_function_inputs(inputs.as_slice());
+                self.fold_inputs(inputs.as_slice());
                 self.fold_many(outputs.iter());
             }
             BlackBoxFuncCall::Blake3 { inputs, outputs } => {
-                self.fold_function_inputs(inputs.as_slice());
+                self.fold_inputs(inputs.as_slice());
                 self.fold_many(outputs.iter());
             }
             BlackBoxFuncCall::EcdsaSecp256k1 {
@@ -400,12 +438,14 @@ where
                 signature,
                 hashed_message,
                 output,
+                predicate,
             } => {
-                self.fold_function_inputs(public_key_x.as_slice());
-                self.fold_function_inputs(public_key_y.as_slice());
-                self.fold_function_inputs(signature.as_slice());
-                self.fold_function_inputs(hashed_message.as_slice());
+                self.fold_inputs(public_key_x.as_slice());
+                self.fold_inputs(public_key_y.as_slice());
+                self.fold_inputs(signature.as_slice());
+                self.fold_inputs(hashed_message.as_slice());
                 self.fold(*output);
+                self.fold_input(predicate);
             }
             BlackBoxFuncCall::EcdsaSecp256r1 {
                 public_key_x,
@@ -413,31 +453,35 @@ where
                 signature,
                 hashed_message,
                 output,
+                predicate,
             } => {
-                self.fold_function_inputs(public_key_x.as_slice());
-                self.fold_function_inputs(public_key_y.as_slice());
-                self.fold_function_inputs(signature.as_slice());
-                self.fold_function_inputs(hashed_message.as_slice());
+                self.fold_inputs(public_key_x.as_slice());
+                self.fold_inputs(public_key_y.as_slice());
+                self.fold_inputs(signature.as_slice());
+                self.fold_inputs(hashed_message.as_slice());
                 self.fold(*output);
+                self.fold_input(predicate);
             }
-            BlackBoxFuncCall::MultiScalarMul { points, scalars, outputs } => {
-                self.fold_function_inputs(points.as_slice());
-                self.fold_function_inputs(scalars.as_slice());
+            BlackBoxFuncCall::MultiScalarMul { points, scalars, predicate, outputs } => {
+                self.fold_inputs(points.as_slice());
+                self.fold_inputs(scalars.as_slice());
+                self.fold_input(predicate);
                 let (x, y, i) = outputs;
                 self.fold(*x);
                 self.fold(*y);
                 self.fold(*i);
             }
-            BlackBoxFuncCall::EmbeddedCurveAdd { input1, input2, outputs } => {
-                self.fold_function_inputs(input1.as_slice());
-                self.fold_function_inputs(input2.as_slice());
+            BlackBoxFuncCall::EmbeddedCurveAdd { input1, input2, predicate, outputs } => {
+                self.fold_inputs(input1.as_slice());
+                self.fold_inputs(input2.as_slice());
+                self.fold_input(predicate);
                 let (x, y, i) = outputs;
                 self.fold(*x);
                 self.fold(*y);
                 self.fold(*i);
             }
             BlackBoxFuncCall::Keccakf1600 { inputs, outputs } => {
-                self.fold_function_inputs(inputs.as_slice());
+                self.fold_inputs(inputs.as_slice());
                 self.fold_many(outputs.iter());
             }
             BlackBoxFuncCall::RecursiveAggregation {
@@ -446,43 +490,35 @@ where
                 public_inputs,
                 key_hash,
                 proof_type: _,
+                predicate,
             } => {
-                self.fold_function_inputs(verification_key.as_slice());
-                self.fold_function_inputs(proof.as_slice());
-                self.fold_function_inputs(public_inputs.as_slice());
-                self.fold_function_input(key_hash);
+                self.fold_inputs(verification_key.as_slice());
+                self.fold_inputs(proof.as_slice());
+                self.fold_inputs(public_inputs.as_slice());
+                self.fold_input(key_hash);
+                self.fold_input(predicate);
             }
-            BlackBoxFuncCall::BigIntAdd { .. }
-            | BlackBoxFuncCall::BigIntSub { .. }
-            | BlackBoxFuncCall::BigIntMul { .. }
-            | BlackBoxFuncCall::BigIntDiv { .. } => {}
-            BlackBoxFuncCall::BigIntFromLeBytes { inputs, modulus: _, output: _ } => {
-                self.fold_function_inputs(inputs.as_slice());
-            }
-            BlackBoxFuncCall::BigIntToLeBytes { input: _, outputs } => {
-                self.fold_many(outputs.iter());
-            }
-            BlackBoxFuncCall::Poseidon2Permutation { inputs, outputs, len: _ } => {
-                self.fold_function_inputs(inputs.as_slice());
+            BlackBoxFuncCall::Poseidon2Permutation { inputs, outputs } => {
+                self.fold_inputs(inputs.as_slice());
                 self.fold_many(outputs.iter());
             }
             BlackBoxFuncCall::Sha256Compression { inputs, hash_values, outputs } => {
-                self.fold_function_inputs(inputs.as_slice());
-                self.fold_function_inputs(hash_values.as_slice());
+                self.fold_inputs(inputs.as_slice());
+                self.fold_inputs(hash_values.as_slice());
                 self.fold_many(outputs.iter());
             }
         }
     }
 
-    fn fold_function_input<F: AcirField>(&mut self, input: &FunctionInput<F>) {
-        if let circuit::opcodes::ConstantOrWitnessEnum::Witness(witness) = input.input() {
-            self.fold(witness);
+    fn fold_inputs<F: AcirField>(&mut self, inputs: &[FunctionInput<F>]) {
+        for input in inputs {
+            self.fold_input(input);
         }
     }
 
-    fn fold_function_inputs<F: AcirField>(&mut self, inputs: &[FunctionInput<F>]) {
-        for input in inputs {
-            self.fold_function_input(input);
+    fn fold_input<F: AcirField>(&mut self, input: &FunctionInput<F>) {
+        if let FunctionInput::Witness(witness) = input {
+            self.fold(*witness);
         }
     }
 }

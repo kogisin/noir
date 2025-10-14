@@ -16,12 +16,14 @@ jobs:
   critical-library-list:
     name: Load critical library list
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     outputs:
       libraries: ${{ steps.get_critical_libraries.outputs.libraries }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build list of libraries
         id: get_critical_libraries
@@ -35,10 +37,12 @@ jobs:
   yarn-lock:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Errors if installation would result in modifications to yarn.lock
       - name: Install
@@ -48,10 +52,12 @@ jobs:
   build-nargo:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout Noir repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup toolchain
         uses: dtolnay/rust-toolchain@1.85.0
@@ -67,26 +73,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Package artifacts
-        run: |
-          mkdir dist
-          cp ./target/release/nargo ./dist/nargo
-          7z a -ttar -so -an ./dist/* | 7z a -si ./nargo-x86_64-unknown-linux-gnu.tar.gz
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: nargo
-          path: ./dist/*
+          path: ./target/release/nargo
           retention-days: 3
 
   build-noir-execute:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout Noir repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup toolchain
         uses: dtolnay/rust-toolchain@1.85.0
@@ -97,29 +99,58 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'merge_group' }}
 
-      - name: Build noir-execute
+      - name: Build artifact
         run: cargo build --package noir_artifact_cli --release
-
-      - name: Package artifacts
-        run: |
-          mkdir dist
-          cp ./target/release/noir-execute ./dist/noir-execute
-          7z a -ttar -so -an ./dist/* | 7z a -si ./noir-execute-x86_64-unknown-linux-gnu.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: noir-execute
-          path: ./dist/*
+          path: ./target/release/noir-execute
+          retention-days: 3
+
+  build-noir-ssa:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Noir repo
+        uses: actions/checkout@v5
+
+      - name: Setup toolchain
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: Build artifact
+        run: cargo build --package noir_ssa_cli --release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noir-ssa
+          path: ./target/release/noir-ssa
           retention-days: 3
 
   build-noirc-abi:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout Noir repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup toolchain
         uses: dtolnay/rust-toolchain@1.85.0
@@ -133,8 +164,10 @@ jobs:
       - name: Install Yarn dependencies
         uses: ./.github/actions/setup
 
+      - uses: taiki-e/install-action@just
+
       - name: Build noirc_abi
-        run: ./.github/scripts/noirc-abi-build.sh
+        run: just build-package @noir-lang/noirc_abi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -148,10 +181,12 @@ jobs:
   build-noir-wasm:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup toolchain
         uses: dtolnay/rust-toolchain@1.85.0
@@ -165,11 +200,13 @@ jobs:
       - name: Install Yarn dependencies
         uses: ./.github/actions/setup
 
+      - uses: taiki-e/install-action@just
+
       - name: Build noir_js_types
-        run: yarn workspace @noir-lang/types build
+        run: just build-package @noir-lang/types
 
       - name: Build noir_wasm
-        run: ./.github/scripts/noir-wasm-build.sh
+        run: just build-package @noir-lang/noir_wasm
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -183,10 +220,12 @@ jobs:
   build-acvm-js:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup toolchain
         uses: dtolnay/rust-toolchain@1.85.0
@@ -200,8 +239,10 @@ jobs:
       - name: Install Yarn dependencies
         uses: ./.github/actions/setup
 
+      - uses: taiki-e/install-action@just
+
       - name: Build acvm_js
-        run: ./.github/scripts/acvm_js-build.sh
+        run: just build-package @noir-lang/acvm_js
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -219,10 +260,12 @@ jobs:
     name: ACVM JS (Node.js)
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -241,10 +284,12 @@ jobs:
     name: ACVM JS (Browser)
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -255,8 +300,10 @@ jobs:
       - name: Set up test environment
         uses: ./.github/actions/setup
 
+      - uses: taiki-e/install-action@just
+
       - name: Install Playwright
-        uses: ./.github/actions/install-playwright
+        run: just install-playwright
 
       - name: Run browser tests
         run: yarn workspace @noir-lang/acvm_js test:browser
@@ -266,10 +313,12 @@ jobs:
     name: noirc_abi
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download wasm package artifact
         uses: actions/download-artifact@v4
@@ -283,8 +332,10 @@ jobs:
       - name: Run node tests
         run: yarn workspace @noir-lang/noirc_abi test
 
+      - uses: taiki-e/install-action@just
+
       - name: Install Playwright
-        uses: ./.github/actions/install-playwright
+        run: just install-playwright
 
       - name: Run browser tests
         run: yarn workspace @noir-lang/noirc_abi test:browser
@@ -294,10 +345,12 @@ jobs:
     name: Noir JS
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download nargo binary
         uses: ./.github/actions/download-nargo
@@ -317,12 +370,14 @@ jobs:
       - name: Install Yarn dependencies
         uses: ./.github/actions/setup
 
+      - uses: taiki-e/install-action@just
+
       - name: Build noir_js_types
-        run: yarn workspace @noir-lang/types build
+        run: just build-package @noir-lang/types
 
       - name: Run noir_js tests
         run: |
-          yarn workspace @noir-lang/noir_js build
+          just build-package @noir-lang/noir_js
           yarn workspace @noir-lang/noir_js test
 
   test-noir-wasm:
@@ -330,10 +385,12 @@ jobs:
     name: noir_wasm
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download wasm package artifact
         uses: actions/download-artifact@v4
@@ -350,8 +407,10 @@ jobs:
       - name: Build fixtures
         run: yarn workspace @noir-lang/noir_wasm test:build_fixtures
 
+      - uses: taiki-e/install-action@just
+
       - name: Install Playwright
-        uses: ./.github/actions/install-playwright
+        run: just install-playwright
 
       - name: Run node tests
         run: yarn workspace @noir-lang/noir_wasm test:node
@@ -364,10 +423,12 @@ jobs:
     name: noir_codegen
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download nargo binary
         uses: ./.github/actions/download-nargo
@@ -387,11 +448,13 @@ jobs:
       - name: Install Yarn dependencies
         uses: ./.github/actions/setup
 
+      - uses: taiki-e/install-action@just
+
       - name: Build noir_js_types
-        run: yarn workspace @noir-lang/types build
+        run: just build-package @noir-lang/types
 
       - name: Build noir_js
-        run: yarn workspace @noir-lang/noir_js build
+        run: just build-package @noir-lang/noir_js
 
       - name: Run noir_codegen tests
         run: yarn workspace @noir-lang/noir_codegen test
@@ -401,10 +464,12 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [build-acvm-js, build-noir-wasm, build-nargo, build-noirc-abi]
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install `bb`
         run: |
@@ -447,65 +512,81 @@ jobs:
         run: |
           yarn test:node
 
-  test-integration-browser:
-    name: Integration Tests (Browser)
-    runs-on: ubuntu-22.04
-    needs: [build-acvm-js, build-noir-wasm, build-noirc-abi]
-    timeout-minutes: 30
+  # TODO(https://github.com/noir-lang/noir/issues/9935): These tests are currently broken as they are currently written
+  # We have other browser tests under `examples/browser`, but it would be good to get these working again.
+  # test-integration-browser:
+  #   name: Integration Tests (Browser)
+  #   runs-on: ubuntu-22.04
+  #   needs: [build-acvm-js, build-noir-wasm, build-noirc-abi]
+  #   timeout-minutes: 30
+  #   permissions:
+  #     contents: read
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v5
 
-      - name: Download acvm_js package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: acvm-js
-          path: ./acvm-repo/acvm_js
+  #     - name: Download acvm_js package artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: acvm-js
+  #         path: ./acvm-repo/acvm_js
 
-      - name: Download noir_wasm package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: noir_wasm
-          path: ./compiler/wasm
+  #     - name: Download noir_wasm package artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: noir_wasm
+  #         path: ./compiler/wasm
 
-      - name: Download noirc_abi package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: noirc_abi_wasm
-          path: ./tooling/noirc_abi_wasm
+  #     - name: Download noirc_abi package artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: noirc_abi_wasm
+  #         path: ./tooling/noirc_abi_wasm
 
-      - name: Install Yarn dependencies
-        uses: ./.github/actions/setup
+  #     - name: Install Yarn dependencies
+  #       uses: ./.github/actions/setup
 
-      - name: Install Playwright
-        uses: ./.github/actions/install-playwright
+  #     - uses: taiki-e/install-action@just
 
-      - name: Setup `integration-tests`
-        run: |
-          # Note the lack of spaces between package names.
-          PACKAGES_TO_BUILD="@noir-lang/types,@noir-lang/noir_js"
-          yarn workspaces foreach -Wvtp --from "{$PACKAGES_TO_BUILD}" run build
+  #     - name: Install Playwright
+  #       run: just install-playwright
 
-      - name: Run `integration-tests`
-        working-directory: ./compiler/integration-tests
-        run: |
-          yarn test:browser
+  #     - name: Setup `integration-tests`
+  #       run: |
+  #         # Note the lack of spaces between package names.
+  #         PACKAGES_TO_BUILD="@noir-lang/types,@noir-lang/noir_js"
+  #         yarn workspaces foreach -Wvtp --from "{$PACKAGES_TO_BUILD}" run build
+
+  #     - name: Run `integration-tests`
+  #       working-directory: ./compiler/integration-tests
+  #       run: |
+  #         yarn test:browser
 
   test-examples:
     name: Example scripts
     runs-on: ubuntu-24.04
-    needs: [build-nargo, build-noir-execute]
+    needs: [build-nargo, build-noir-execute, build-noir-ssa, build-acvm-js, build-noirc-abi]
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1.2.0
+        uses: foundry-rs/foundry-toolchain@v1.4.0
         with:
-          version: nightly-8660e5b941fe7f4d67e246cfd3dafea330fb53b1
+          version: v1.3.3
+
+      - name: Install Yarn dependencies
+        uses: ./.github/actions/setup
+
+      - uses: taiki-e/install-action@just
+
+      - name: Install Playwright
+        run: just install-playwright
 
       - name: Install `bb`
         run: |
@@ -519,28 +600,44 @@ jobs:
       - name: Download noir-execute binary
         uses: ./.github/actions/download-noir-execute
 
-      - name: Run `prove_and_verify`
-        working-directory: ./examples/prove_and_verify
-        run: ./test.sh
+      - name: Download noir-ssa binary
+        uses: ./.github/actions/download-noir-ssa
 
-      - name: Run `solidity_verifier`
-        working-directory: ./examples/solidity_verifier
-        run: ./test.sh
+      - name: Download acvm_js package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: acvm-js
+          path: ./acvm-repo/acvm_js
 
-      - name: Run `oracle_transcript`
-        working-directory: ./examples/oracle_transcript
-        run: ./test.sh
+      - name: Download noirc_abi package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: noirc_abi_wasm
+          path: ./tooling/noirc_abi_wasm
+
+      - name: Build noir_js
+        run: |
+          just build-package @noir-lang/types
+          just build-package @noir-lang/noir_js
+
+      - name: Run examples
+        run: just run-examples
 
   external-repo-checks:
     needs: [build-nargo, critical-library-list]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson( needs.critical-library-list.outputs.libraries )}}
 
     name: Check external repo - ${{ matrix.repo }}/${{ matrix.path }}
+    env:
+      OUTPUT_FILE: ${{ github.workspace }}/.github/critical_libraries_status/${{ matrix.repo }}/${{ matrix.path }}.actual.jsonl
+
     steps:
       - name: Matrix Info
         run: |
@@ -550,66 +647,57 @@ jobs:
           echo "timeout: ${{ matrix.timeout }}"
 
       - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          path: noir-repo
+        uses: actions/checkout@v5
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ matrix.repo }}
           path: test-repo
           ref: ${{ matrix.ref }}
 
       - name: Download nargo binary
-        uses: ./noir-repo/.github/actions/download-nargo
+        uses: ./.github/actions/download-nargo
 
-      - name: Remove requirements on compiler version
-        working-directory: ./test-repo
+      - name: Generate paths
+        id: test_report_name
         run: |
-          # Github actions seems to not expand "**" in globs by default.
-          shopt -s globstar
-          sed -i '/^compiler_version/d' ./**/Nargo.toml
-
-      - name: Run nargo test
-        id: test_report
-        working-directory: ./test-repo/${{ matrix.path }}
-        run: |
-          BEFORE=$SECONDS
-          nargo test --silence-warnings --skip-brillig-constraints-check --format json ${{ matrix.nargo_args }} | tee $OUTPUT_FILE
-          TIME=$(($SECONDS-$BEFORE))
-
-          if [ ! -s $OUTPUT_FILE ]; then
-            # The file is empty so we delete it to signal that `nargo test` failed before it could run any tests
-            rm -f $OUTPUT_FILE
-          fi
-
-          NAME=${{ matrix.repo }}/${{ matrix.path }}
           # Replace any slashes with underscores
           NAME=${NAME//\//_}
           TEST_REPORT_NAME=test_report_$NAME
           echo "test_report_name=$TEST_REPORT_NAME" >> $GITHUB_OUTPUT
-
-          jq --null-input "[{ name: \"$NAME\", value: (\"$TIME\" | tonumber), unit: \"s\" }]" > $TEST_REPORT_NAME.json
         env:
+          NAME: ${{ matrix.repo }}/${{ matrix.path }}
+
+      - name: Run nargo test
+        run: |
+          # Github actions seems to not expand "**" in globs by default.
+          shopt -s globstar
+
+          .github/scripts/run-external-repo-tests.sh
+        env:
+          REPO_DIR: ./test-repo
+          PROJECT_PATH: ${{ matrix.path }}
           NARGO_IGNORE_TEST_FAILURES_FROM_FOREIGN_CALLS: true
-          OUTPUT_FILE: ${{ github.workspace }}/noir-repo/.github/critical_libraries_status/${{ matrix.repo }}/${{ matrix.path }}.actual.jsonl
+          NARGO_ARGS: ${{ matrix.nargo_args }}
+          NAME: ${{ steps.test_report_name.outputs.test_report_name }}
+          BENCHMARK_FILE: ${{ steps.test_report_name.outputs.test_report_name }}.json
+
       - name: Compare test results
-        working-directory: ./noir-repo
         run: .github/scripts/check_test_results.sh .github/critical_libraries_status/${{ matrix.repo }}/${{ matrix.path }}.failures.jsonl .github/critical_libraries_status/${{ matrix.repo }}/${{ matrix.path }}.actual.jsonl
 
       - name: Upload test report
-        if: ${{ matrix.timeout > 10 }} # We want to avoid recording benchmarking for a ton of tiny libraries, these should be covered with aggressive timeouts
+        if: ${{ matrix.timeout > 20 }} # We want to avoid recording benchmarking for a ton of tiny libraries, these should be covered with aggressive timeouts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.test_report.outputs.test_report_name }}
-          path: ./test-repo/${{ matrix.path }}/${{ steps.test_report.outputs.test_report_name }}.json
+          name: ${{ steps.test_report_name.outputs.test_report_name }}
+          path: ${{ steps.test_report_name.outputs.test_report_name }}.json
           retention-days: 3
           overwrite: true
 
       - name: Check test time limit
         run: |
-          TIME=$(jq '.[0].value' ./test-repo/${{ matrix.path }}/${{ steps.test_report.outputs.test_report_name }}.json)
+          TIME=$(jq '.[0].value' ${{ steps.test_report_name.outputs.test_report_name }}.json)
           if awk 'BEGIN{exit !(ARGV[1]>ARGV[2])}' "$TIME" "${{ matrix.timeout }}"; then
             # Don't bump this timeout without understanding why this has happened and confirming that you're not the cause.
             echo "Failing due to test suite exceeding timeout..."
@@ -619,18 +707,20 @@ jobs:
           fi
 
   compile-noir-contracts:
+    name: Compile `noir-contracts` zero inliner aggressiveness
     needs: [build-nargo]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    name: Compile `noir-contracts` zero inliner aggressiveness
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: noir-repo
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: AztecProtocol/aztec-packages
           path: test-repo
@@ -663,7 +753,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download matrix test reports
         uses: actions/download-artifact@v4
@@ -679,6 +769,8 @@ jobs:
           jq --slurp '. | flatten' ./reports/* | tee test_bench.json
 
       - name: Store benchmark result
+        # We don't run this step on external PRs
+        if: github.ref == 'refs/heads/master' || github.event.pull_request.head.repo.full_name == github.repository
         uses: benchmark-action/github-action-benchmark@4de1bed97a47495fc4c5404952da0499e31f5c29
         with:
           name: "Test Suite Duration"
@@ -711,9 +803,11 @@ jobs:
       - test-noir-wasm
       - test-noir-codegen
       - test-integration-node
-      - test-integration-browser
+      #- test-integration-browser
       - test-examples
       - compile-noir-contracts
+    permissions:
+      contents: read
 
     steps:
         - name: Report overall success

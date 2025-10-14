@@ -1,4 +1,4 @@
-use crate::tests::check_errors;
+use crate::check_errors;
 
 #[test]
 fn cannot_mutate_immutable_variable() {
@@ -11,7 +11,7 @@ fn cannot_mutate_immutable_variable() {
 
     fn mutate(_: &mut [Field; 1]) {}
     "#;
-    check_errors(src);
+    check_errors!(src);
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn cannot_mutate_immutable_variable_on_member_access() {
         *foo = 1;
     }
     "#;
-    check_errors(src);
+    check_errors!(src);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn does_not_crash_when_passing_mutable_undefined_variable() {
         *foo = 1;
     }
     "#;
-    check_errors(src);
+    check_errors!(src);
 }
 
 #[test]
@@ -70,5 +70,5 @@ fn constrained_reference_to_unconstrained() {
         *x = y;
     }
     "#;
-    check_errors(src);
+    check_errors!(src);
 }

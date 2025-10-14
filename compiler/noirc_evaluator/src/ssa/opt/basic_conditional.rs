@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use acvm::AcirField;
-use fxhash::FxHashMap as HashMap;
 use iter_extended::vecmap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::ssa::{
     Ssa,
@@ -16,6 +16,7 @@ use crate::ssa::{
         post_order::PostOrder,
         value::ValueId,
     },
+    opt::flatten_cfg::WorkList,
 };
 
 use super::flatten_cfg::Context;
@@ -206,7 +207,7 @@ fn block_cost(block: BasicBlockId, dfg: &DataFlowGraph) -> u32 {
                 // check if index is in bound
                 if let (Some(index), Some(len)) = (dfg.get_numeric_constant(*index), dfg.try_get_array_length(*array)) {
                     // The index is in-bounds
-                    if index.to_u128() < len as u128 {
+                    if index.to_u128() < u128::from(len) {
                         in_bound = true;
                     }
                 }
@@ -304,31 +305,27 @@ impl Context<'_> {
         //0. initialize the context for flattening a 'single conditional'
         let old_target = self.target_block;
         let old_no_predicate = self.no_predicate;
-        let mut queue = vec![];
         self.target_block = conditional.block_entry;
         self.no_predicate = true;
         //1. process 'then' branch
         self.inline_block(conditional.block_entry, no_predicates);
-        let to_process = self.handle_terminator(conditional.block_entry, &queue);
-        queue.extend(to_process);
-        if let Some(then) = conditional.block_then {
-            assert_eq!(queue.pop(), conditional.block_then);
-            self.inline_block(then, no_predicates);
-            let to_process = self.handle_terminator(then, &queue);
+        let mut work_list = WorkList::new();
+        let to_process = self.handle_terminator(conditional.block_entry, &work_list);
+        work_list.extend(to_process);
 
-            for incoming_block in to_process {
-                if !queue.contains(&incoming_block) {
-                    queue.push(incoming_block);
-                }
-            }
+        if let Some(then) = conditional.block_then {
+            assert_eq!(work_list.pop(), conditional.block_then);
+            self.inline_block(then, no_predicates);
+            let to_process = self.handle_terminator(then, &work_list);
+            work_list.extend(to_process);
         }
 
         //2. process 'else' branch, in case there is no 'then'
-        let next = queue.pop();
+        let next = work_list.pop();
         if next == conditional.block_else {
             let next = next.unwrap();
             self.inline_block(next, no_predicates);
-            let _ = self.handle_terminator(next, &queue);
+            let _ = self.handle_terminator(next, &work_list);
         } else {
             assert_eq!(next, Some(conditional.block_exit));
         }
@@ -361,6 +358,9 @@ impl Context<'_> {
                 let return_values = vecmap(return_values, |value| self.inserter.resolve(value));
                 TerminatorInstruction::Return { return_values, call_stack }
             }
+            TerminatorInstruction::Unreachable { call_stack } => {
+                TerminatorInstruction::Unreachable { call_stack }
+            }
         };
         self.inserter.function.dfg.set_block_terminator(conditional.block_entry, new_terminator);
         self.inserter.map_data_bus_in_place();
@@ -387,7 +387,10 @@ impl Context<'_> {
 
 #[cfg(test)]
 mod test {
-    use crate::ssa::{Ssa, opt::assert_normalized_ssa_equals};
+    use crate::{
+        assert_ssa_snapshot,
+        ssa::{Ssa, opt::assert_normalized_ssa_equals},
+    };
 
     #[test]
     fn basic_jmpif() {
@@ -407,22 +410,20 @@ mod test {
         let ssa = Ssa::from_str(src).unwrap();
         assert_eq!(ssa.main().reachable_blocks().len(), 4);
 
-        let expected = "
-            brillig(inline) fn foo f0 {
-              b0(v0: u32):
-                v2 = eq v0, u32 0
-                v3 = not v2
-                v4 = cast v2 as u32
-                v5 = cast v3 as u32
-                v7 = unchecked_mul v4, u32 3
-                v9 = unchecked_mul v5, u32 5
-                v10 = unchecked_add v7, v9
-                return v10
-            }
-            ";
-
         let ssa = ssa.flatten_basic_conditionals();
-        assert_normalized_ssa_equals(ssa, expected);
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn foo f0 {
+          b0(v0: u32):
+            v2 = eq v0, u32 0
+            v3 = not v2
+            v4 = cast v2 as u32
+            v5 = cast v3 as u32
+            v7 = unchecked_mul v4, u32 3
+            v9 = unchecked_mul v5, u32 5
+            v10 = unchecked_add v7, v9
+            return v10
+        }
+        ");
     }
 
     #[test]
@@ -486,7 +487,9 @@ mod test {
         let ssa = Ssa::from_str(src).unwrap();
         assert_eq!(ssa.main().reachable_blocks().len(), 10);
 
-        let expected = "
+        let ssa = ssa.flatten_basic_conditionals();
+        assert_eq!(ssa.main().reachable_blocks().len(), 4);
+        assert_ssa_snapshot!(ssa, @r"
         brillig(inline) fn foo f0 {
           b0(v0: u32):
             v3 = eq v0, u32 5
@@ -517,10 +520,6 @@ mod test {
           b3(v1: u32):
             return v1
         }
-            ";
-
-        let ssa = ssa.flatten_basic_conditionals();
-        assert_eq!(ssa.main().reachable_blocks().len(), 4);
-        assert_normalized_ssa_equals(ssa, expected);
+        ");
     }
 }

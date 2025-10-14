@@ -4,7 +4,6 @@ use acir::circuit::Opcode;
 use acir::circuit::OpcodeLocation;
 use clap::Args;
 use color_eyre::eyre::{self, Context};
-use nargo::PrintOutput;
 use nargo::errors::try_to_diagnose_runtime_error;
 use nargo::foreign_calls::DefaultForeignCallBuilder;
 use noir_artifact_cli::fs::artifact::read_program_from_file;
@@ -92,7 +91,7 @@ fn run_with_generator(
         &program.bytecode,
         initial_witness,
         &Bn254BlackBoxSolver(pedantic_solving),
-        &mut DefaultForeignCallBuilder::default().with_output(PrintOutput::Stdout).build(),
+        &mut DefaultForeignCallBuilder::default().with_output(std::io::stdout()).build(),
     );
     let mut profiling_samples = match solved_witness_stack_err {
         Ok((_, profiling_samples)) => profiling_samples,
@@ -235,7 +234,10 @@ mod tests {
             hash: 27,
             abi: noirc_abi::Abi::default(),
             bytecode: Program {
-                functions: vec![Circuit::default()],
+                functions: vec![Circuit {
+                    function_name: "main".to_string(),
+                    ..Circuit::default()
+                }],
                 unconstrained_functions: vec![
                     BrilligBytecode::default(),
                     BrilligBytecode::default(),
@@ -243,8 +245,7 @@ mod tests {
             },
             debug_symbols: ProgramDebugInfo { debug_infos: vec![DebugInfo::default()] },
             file_map: BTreeMap::default(),
-            names: vec!["main".to_string()],
-            brillig_names: Vec::new(),
+            expression_width: acir::circuit::ExpressionWidth::Bounded { width: 4 },
         };
 
         // Write the artifact to a file
@@ -262,7 +263,7 @@ mod tests {
                 &artifact_path,
                 &prover_toml_path,
                 &flamegraph_generator,
-                &Some(temp_dir.into_path()),
+                &Some(temp_dir.keep()),
                 false,
                 false,
                 false

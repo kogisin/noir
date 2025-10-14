@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::hash::BuildHasher;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -28,12 +29,12 @@ use rayon::prelude::*;
 
 /// Compile the program and its secret execution trace into ACIR format
 #[derive(Debug, Clone, Args)]
-pub(crate) struct CompileCommand {
+pub struct CompileCommand {
     #[clap(flatten)]
     pub(super) package_options: PackageOptions,
 
     #[clap(flatten)]
-    compile_options: CompileOptions,
+    pub(super) compile_options: CompileOptions,
 
     /// Watch workspace and recompile on changes.
     #[clap(long, hide = true)]
@@ -52,10 +53,14 @@ impl WorkspaceCommand for CompileCommand {
 
 pub(crate) fn run(args: CompileCommand, workspace: Workspace) -> Result<(), CliError> {
     if args.watch {
+        if args.compile_options.debug_compile_stdin {
+            return Err(CliError::CantWatchStdin);
+        }
         watch_workspace(&workspace, &args.compile_options)
             .map_err(|err| CliError::Generic(err.to_string()))?;
     } else {
-        compile_workspace_full(&workspace, &args.compile_options)?;
+        let debug_compile_stdin = None;
+        compile_workspace_full(&workspace, &args.compile_options, debug_compile_stdin)?;
     }
     Ok(())
 }
@@ -74,7 +79,8 @@ fn watch_workspace(workspace: &Workspace, compile_options: &CompileOptions) -> n
     let mut screen = std::io::stdout();
     write!(screen, "{}", termion::cursor::Save).unwrap();
     screen.flush().unwrap();
-    let _ = compile_workspace_full(workspace, compile_options);
+    let debug_compile_stdin = None;
+    let _ = compile_workspace_full(workspace, compile_options, debug_compile_stdin);
     for res in rx {
         let debounced_events = res.map_err(|mut err| err.remove(0))?;
 
@@ -95,7 +101,8 @@ fn watch_workspace(workspace: &Workspace, compile_options: &CompileOptions) -> n
         if noir_files_modified {
             write!(screen, "{}{}", termion::cursor::Restore, termion::clear::AfterCursor).unwrap();
             screen.flush().unwrap();
-            let _ = compile_workspace_full(workspace, compile_options);
+            let debug_compile_stdin = None;
+            let _ = compile_workspace_full(workspace, compile_options, debug_compile_stdin);
         }
     }
 
@@ -105,20 +112,38 @@ fn watch_workspace(workspace: &Workspace, compile_options: &CompileOptions) -> n
 }
 
 /// Parse all files in the workspace.
-fn parse_workspace(workspace: &Workspace) -> (FileManager, ParsedFiles) {
+pub fn parse_workspace(
+    workspace: &Workspace,
+    debug_compile_stdin: Option<String>,
+) -> (FileManager, ParsedFiles) {
     let mut file_manager = workspace.new_file_manager();
-    insert_all_files_for_workspace_into_file_manager(workspace, &mut file_manager);
+
+    if let Some(main_nr) = debug_compile_stdin {
+        file_manager.add_file_with_source(Path::new("src/main.nr"), main_nr);
+    } else {
+        insert_all_files_for_workspace_into_file_manager(workspace, &mut file_manager);
+    }
+
     let parsed_files = parse_all(&file_manager);
     (file_manager, parsed_files)
 }
 
 /// Parse and compile the entire workspace, then report errors.
 /// This is the main entry point used by all other commands that need compilation.
-pub(super) fn compile_workspace_full(
+pub fn compile_workspace_full(
     workspace: &Workspace,
     compile_options: &CompileOptions,
+    debug_compile_stdin: Option<String>, // use this String as STDIN if present
 ) -> Result<(), CliError> {
-    let (workspace_file_manager, parsed_files) = parse_workspace(workspace);
+    let mut debug_compile_stdin = debug_compile_stdin;
+    if compile_options.debug_compile_stdin && debug_compile_stdin.is_none() {
+        let mut main_nr = String::new();
+        let stdin = std::io::stdin();
+        let mut stdin_handle = stdin.lock();
+        stdin_handle.read_to_string(&mut main_nr).expect("reading from stdin to succeed");
+        debug_compile_stdin = Some(main_nr);
+    }
+    let (workspace_file_manager, parsed_files) = parse_workspace(workspace, debug_compile_stdin);
 
     let compiled_workspace =
         compile_workspace(&workspace_file_manager, &parsed_files, workspace, compile_options);
@@ -194,7 +219,8 @@ fn compile_programs(
 
         // Hash over the entire compiled program, including any post-compile transformations.
         // This is used to detect whether `cached_program` is returned by `compile_program`.
-        let cached_hash = cached_program.as_ref().map(fxhash::hash64);
+        let cached_hash =
+            cached_program.as_ref().map(|prog| rustc_hash::FxBuildHasher.hash_one(prog));
 
         // Compile the program, or use the cached artifacts if it matches.
         let (program, warnings) = compile_program(
@@ -206,23 +232,6 @@ fn compile_programs(
             cached_program,
         )?;
 
-        if compile_options.check_non_determinism {
-            // As we compile the program again, disable comptime printing so we don't get duplicate output
-            let compile_options =
-                CompileOptions { disable_comptime_printing: true, ..compile_options.clone() };
-            let (program_two, _) = compile_program(
-                file_manager,
-                parsed_files,
-                workspace,
-                package,
-                &compile_options,
-                load_cached_program(package),
-            )?;
-            if fxhash::hash64(&program) != fxhash::hash64(&program_two) {
-                panic!("Non deterministic result compiling {}", package.name);
-            }
-        }
-
         // Choose the target width for the final, backend specific transformation.
         let target_width =
             get_target_width(package.expression_width, compile_options.expression_width);
@@ -230,16 +239,10 @@ fn compile_programs(
         // If the compiled program is the same as the cached one, we don't apply transformations again, unless the target width has changed.
         // The transformations might not be idempotent, which would risk creating witnesses that don't work with earlier versions,
         // based on which we might have generated a verifier already.
-        if cached_hash == Some(fxhash::hash64(&program)) {
-            let width_matches = program
-                .program
-                .functions
-                .iter()
-                .all(|circuit| circuit.expression_width == target_width);
-
-            if width_matches {
-                return Ok(((), warnings));
-            }
+        if cached_hash == Some(rustc_hash::FxBuildHasher.hash_one(&program))
+            && program.expression_width == target_width
+        {
+            return Ok(((), warnings));
         }
         // Run ACVM optimizations and set the target width.
         let program = nargo::ops::transform_program(program, target_width);
@@ -253,8 +256,13 @@ fn compile_programs(
     };
 
     // Configure a thread pool with a larger stack size to prevent overflowing stack in large programs.
-    // Default is 2MB.
-    let pool = rayon::ThreadPoolBuilder::new().stack_size(4 * 1024 * 1024).build().unwrap();
+    // Default is 2MB. Limit threads to the number of packages we actually need to compile.
+    let num_threads = rayon::current_num_threads().min(binary_packages.len()).max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .stack_size(4 * 1024 * 1024)
+        .build()
+        .unwrap();
     let program_results: Vec<CompilationResult<()>> =
         pool.install(|| binary_packages.par_iter().map(compile_package).collect());
 
@@ -320,6 +328,7 @@ pub(crate) fn get_target_width(
 #[cfg(test)]
 mod tests {
     use std::{
+        hash::BuildHasher,
         path::{Path, PathBuf},
         str::FromStr,
     };
@@ -403,7 +412,8 @@ mod tests {
 
         // This could be `.par_iter()` but then error messages are no longer reported
         test_workspaces.iter().for_each(|workspace| {
-            let (file_manager, parsed_files) = parse_workspace(workspace);
+            let debug_compile_stdin = None;
+            let (file_manager, parsed_files) = parse_workspace(workspace, debug_compile_stdin);
             let binary_packages = workspace.into_iter().filter(|package| package.is_binary());
 
             for package in binary_packages {
@@ -456,8 +466,9 @@ mod tests {
                 } else {
                     // Just compare hashes, which would just state that the program failed.
                     // Then we can use the filter option to zoom in one one to see why.
-                    assert!(
-                        fxhash::hash64(&program_1) == fxhash::hash64(&program_2),
+                    assert_eq!(
+                        rustc_hash::FxBuildHasher.hash_one(&program_1),
+                        rustc_hash::FxBuildHasher.hash_one(&program_2),
                         "optimization not idempotent for test program '{}'",
                         package.name
                     );

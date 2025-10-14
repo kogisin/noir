@@ -6,16 +6,14 @@ use super::brillig::{BrilligFunctionId, BrilligInputs, BrilligOutputs};
 pub mod function_id;
 pub use function_id::AcirFunctionId;
 
-use crate::native_types::{Expression, Witness};
+use crate::native_types::{Expression, Witness, display_expression};
 use acir_field::AcirField;
 use serde::{Deserialize, Serialize};
 
 mod black_box_function_call;
 mod memory_operation;
 
-pub use black_box_function_call::{
-    BlackBoxFuncCall, ConstantOrWitnessEnum, FunctionInput, InvalidInputBitSize,
-};
+pub use black_box_function_call::{BlackBoxFuncCall, FunctionInput, InvalidInputBitSize};
 pub use memory_operation::{BlockId, MemOp};
 
 /// Type for a memory block
@@ -102,9 +100,6 @@ pub enum Opcode<F: AcirField> {
         block_id: BlockId,
         /// Describe the memory operation to perform
         op: MemOp<F>,
-        /// Predicate of the memory operation - indicates if it should be skipped
-        /// Disables the execution of the opcode when the expression evaluates to zero
-        predicate: Option<Expression<F>>,
     },
 
     /// Initialize an ACIR array from a vector of witnesses.
@@ -151,49 +146,63 @@ pub enum Opcode<F: AcirField> {
 impl<F: AcirField> std::fmt::Display for Opcode<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Opcode::AssertZero(expr) => expr.fmt(f),
+            Opcode::AssertZero(expr) => {
+                write!(f, "ASSERT ")?;
+                display_expression(expr, true, f)
+            }
             Opcode::BlackBoxFuncCall(g) => g.fmt(f),
-            Opcode::MemoryOp { block_id, op, predicate } => {
-                write!(f, "MEM ")?;
-                if let Some(pred) = predicate {
-                    writeln!(f, "PREDICATE = {pred}")?;
-                }
-
+            Opcode::MemoryOp { block_id, op } => {
                 let is_read = op.operation.is_zero();
-                let is_write = op.operation == Expression::one();
                 if is_read {
-                    write!(f, "(id: {}, read at: {}, value: {}) ", block_id.0, op.index, op.value)
-                } else if is_write {
-                    write!(f, "(id: {}, write {} at: {}) ", block_id.0, op.value, op.index)
+                    write!(f, "READ {} = b{}[{}]", op.value, block_id.0, op.index)
                 } else {
-                    write!(f, "(id: {}, op {} at: {}) ", block_id.0, op.operation, op.index)
+                    write!(f, "WRITE b{}[{}] = {}", block_id.0, op.index, op.value)
                 }
             }
             Opcode::MemoryInit { block_id, init, block_type: databus } => {
                 match databus {
                     BlockType::Memory => write!(f, "INIT ")?,
-                    BlockType::CallData(id) => write!(f, "INIT CALLDATA {} ", id)?,
+                    BlockType::CallData(id) => write!(f, "INIT CALLDATA {id} ")?,
                     BlockType::ReturnData => write!(f, "INIT RETURNDATA ")?,
                 }
-                write!(f, "(id: {}, len: {}) ", block_id.0, init.len())
+                let witnesses =
+                    init.iter().map(|w| format!("{w}")).collect::<Vec<String>>().join(", ");
+                write!(f, "b{} = [{witnesses}]", block_id.0)
             }
             // We keep the display for a BrilligCall and circuit Call separate as they
             // are distinct in their functionality and we should maintain this separation for debugging.
             Opcode::BrilligCall { id, inputs, outputs, predicate } => {
-                write!(f, "BRILLIG CALL func {}: ", id)?;
+                write!(f, "BRILLIG CALL func: {id}, ")?;
                 if let Some(pred) = predicate {
-                    writeln!(f, "PREDICATE = {pred}")?;
+                    write!(f, "predicate: {pred}, ")?;
                 }
-                write!(f, "inputs: {:?}, ", inputs)?;
-                write!(f, "outputs: {:?}", outputs)
+
+                let inputs = inputs
+                    .iter()
+                    .map(|input| format!("{input}"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                let outputs = outputs
+                    .iter()
+                    .map(|output| format!("{output}"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+
+                write!(f, "inputs: [{inputs}], ")?;
+                write!(f, "outputs: [{outputs}]")
             }
             Opcode::Call { id, inputs, outputs, predicate } => {
-                write!(f, "CALL func {}: ", id)?;
+                write!(f, "CALL func: {id}, ")?;
                 if let Some(pred) = predicate {
-                    writeln!(f, "PREDICATE = {pred}")?;
+                    write!(f, "predicate: {pred}, ")?;
                 }
-                write!(f, "inputs: {:?}, ", inputs)?;
-                write!(f, "outputs: {:?}", outputs)
+                let inputs =
+                    inputs.iter().map(|w| format!("{w}")).collect::<Vec<String>>().join(", ");
+                let outputs =
+                    outputs.iter().map(|w| format!("{w}")).collect::<Vec<String>>().join(", ");
+
+                write!(f, "inputs: [{inputs}], ")?;
+                write!(f, "outputs: [{outputs}]")
             }
         }
     }
@@ -202,5 +211,65 @@ impl<F: AcirField> std::fmt::Display for Opcode<F> {
 impl<F: AcirField> std::fmt::Debug for Opcode<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use acir_field::FieldElement;
+
+    use crate::{
+        circuit::opcodes::{BlackBoxFuncCall, BlockId, BlockType, FunctionInput},
+        native_types::{Expression, Witness},
+    };
+
+    use super::Opcode;
+
+    #[test]
+    fn mem_init_display_snapshot() {
+        let mem_init: Opcode<FieldElement> = Opcode::MemoryInit {
+            block_id: BlockId(42),
+            init: (0..10u32).map(Witness).collect(),
+            block_type: BlockType::Memory,
+        };
+
+        insta::assert_snapshot!(
+            mem_init.to_string(),
+            @"INIT b42 = [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9]"
+        );
+    }
+
+    #[test]
+    fn blackbox_snapshot() {
+        let xor: Opcode<FieldElement> = Opcode::BlackBoxFuncCall(BlackBoxFuncCall::XOR {
+            lhs: FunctionInput::Witness(0.into()),
+            rhs: FunctionInput::Witness(1.into()),
+            num_bits: 32,
+            output: Witness(3),
+        });
+
+        insta::assert_snapshot!(
+            xor.to_string(),
+            @"BLACKBOX::XOR inputs: [w0, w1], bits: 32, output: w3"
+        );
+    }
+
+    #[test]
+    fn range_display_snapshot() {
+        let range: Opcode<FieldElement> = Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
+            input: FunctionInput::Witness(0.into()),
+            num_bits: 32,
+        });
+
+        insta::assert_snapshot!(
+            range.to_string(),
+            @"BLACKBOX::RANGE input: w0, bits: 32"
+        );
+    }
+
+    #[test]
+    fn display_zero() {
+        let zero = Opcode::AssertZero(Expression::<FieldElement>::default());
+        assert_eq!(zero.to_string(), "ASSERT 0 = 0");
     }
 }

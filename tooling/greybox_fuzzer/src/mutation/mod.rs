@@ -31,6 +31,7 @@ pub struct InputMutator {
     full_dictionary: FullDictionary,
 }
 
+pub use dictionary::add_elements_from_input_map_to_vector_without_abi;
 const MUTATION_LOG_MIN: u32 = 0;
 const MUTATION_LOG_MAX: u32 = 5;
 /// NodeWeight determines the probability of mutating a particular object
@@ -76,6 +77,11 @@ impl InputMutator {
     /// Fill the dictionary with values from an interesting input
     pub fn update_dictionary(&mut self, testcase: &InputMap) {
         self.full_dictionary.update(&self.abi, testcase);
+    }
+
+    /// Update the dictionary with values from a vector of field elements
+    pub fn update_dictionary_from_vector(&mut self, elements: &[FieldElement]) {
+        self.full_dictionary.update_from_vector(elements);
     }
 
     /// Count weights of each element recursively (complex structures return a vector of weights of their most basic elements)
@@ -207,7 +213,7 @@ impl InputMutator {
                 };
                 // This is an array and can be structurally mutated if the number of elements is more than one
                 // This is an array and can be structurally mutated if the number of elements is more than one
-                let arrays_hit = arrays_hit + ((length > 1) as usize);
+                let arrays_hit = arrays_hit + usize::from(length > 1);
                 let mut structural_mutation_directive = None;
                 let mut element_vector_with_value_mutation: Vec<InputValue> = (0..length)
                     .zip(weight_tree_node.subnodes.as_ref().unwrap())
@@ -664,9 +670,11 @@ impl InputMutator {
     ) -> InputMap {
         let mut starting_input_value = previous_input_map.clone();
 
-        if additional_input_map.is_some() && prng.gen_range(0..4).is_zero() {
-            starting_input_value =
-                self.splice_two_maps(&previous_input_map, &additional_input_map.unwrap(), prng);
+        if let Some(additional_input_map) = additional_input_map {
+            if prng.gen_range(0..4).is_zero() {
+                starting_input_value =
+                    self.splice_two_maps(&previous_input_map, &additional_input_map, prng);
+            }
         }
         for _ in 0..(1 << prng.gen_range(MUTATION_LOG_MIN..=MUTATION_LOG_MAX)) {
             starting_input_value = self.mutate_input_map_single(&starting_input_value, prng);

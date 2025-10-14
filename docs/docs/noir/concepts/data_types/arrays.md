@@ -17,9 +17,9 @@ An array is one way of grouping together values into one compound type. Array ty
 or explicitly specified via the syntax `[<Type>; <Size>]`:
 
 ```rust
-fn main(x : Field, y : Field) {
+fn main(x : u64, y : u64) {
     let my_arr = [x, y];
-    let your_arr: [Field; 2] = [x, y];
+    let your_arr: [u64; 2] = [x, y];
 }
 ```
 
@@ -75,6 +75,42 @@ However, multidimensional slices are not supported. For example, the following c
 
 ```rust
 let slice : [[Field]] = &[];
+```
+
+## Dynamic Indexing
+
+Using constant indices of arrays will often be more efficient at runtime in constrained code.
+Indexing an array with non-constant indices (indices derived from the inputs to the program, or returned from unconstrained functions) is also
+called "dynamic indexing" and incurs a slight runtime cost:
+
+```rust
+fn main(x: u32) {
+    let array = [1, 2, 3, 4];
+
+    // This is a constant index, after inlining the compiler sees that this
+    // will always be `array[2]`
+    let _a = array[double(1)];
+
+    // This is a non-constant index, there is no way to know which u32 value
+    // will be used as an index here
+    let _b = array[double(x)];
+}
+
+fn double(y: u32) -> u32 {
+    y * 2
+}
+```
+
+There is another restriction with dynamic indices: they cannot be used on arrays with
+elements which contain a reference type:
+
+```rust
+fn main(x: u32) {
+    let array = [&mut 1, &mut 2, &mut 3, &mut 4];
+
+    // error! Only constant indices may be used here since `array` contains references internally!
+    let _c = array[x];
+}
 ```
 
 ## Types
